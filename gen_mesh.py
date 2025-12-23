@@ -8,7 +8,8 @@ from scipy.interpolate import splprep, splev
 from typing import List, Tuple, Optional, Dict, Any
 from scipy.spatial import cKDTree
 
-from utilize.mesh_util import write_mshv2_triangular, extract_edge_from_face
+from utilize.mesh_io import write_mshv2_triangular
+from utilize.mesh_util import extract_edge_from_face
 
 class MaskTo2DMesh:
     """

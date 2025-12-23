@@ -7,14 +7,14 @@ import json
 from pathlib import Path
 from typing import List
 import numpy as np
-import cupy as cp
 from scipy import sparse
 import taichi as ti
 ti.init(arch=ti.cpu, debug=True, default_fp=ti.f64)
 
 from const import ROOT_DIR, OUTPUT_DIR
-from utilize.mesh_util import read_mshv2_triangular, mesh_obj_tri, write_mshv2_triangular
-from diffpd_2d import read_msh
+from utilize.mesh_io import read_mshv2_triangular, write_mshv2_triangular
+from utilize.mesh_util import mesh_obj_tri
+from deformation_model.diffpd_2d import read_msh
 
 @ti.data_oriented
 class Soft2DNocontact:
@@ -416,11 +416,3 @@ if __name__ == "__main__":
             json.dump(results, f)
     except Exception as e:
         print(f"Error saving results: {e}")
-
-    """
-    不对结果进行可视化，如有需要在实验阶段补充：
-    输入：Image -> Soft2D模型 -> affordance值
-    1. 输入图像预处理：将图像转换为适合Soft2D模型的格式（如网格表示）。
-    2. Soft2D模型计算：使用Soft2D类计算各候选接触点的affordance值。
-    3. 结果可视化：将affordance值映射回图像空间，并使用heatmap进行可视化展示。
-    """

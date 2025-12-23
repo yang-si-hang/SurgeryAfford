@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+# 这个 name 只是给 pip 看的 (比如 pip list)
+# 它 不会 影响你的 import 名字
+name = "afford-est" 
+version = "0.0.1"
+
+[tool.setuptools.packages.find]
+# (关键) 告诉 pip 在当前目录 ('.') 自动查找所有 "包"
+# 它会自动找到 deformation_model, sofa, utilize
+where = ["."]
+
+[tool.setuptools]
+# (关键) 告诉 pip 哪些独立的 .py 文件也应该被当作 "模块" 安装
+py-modules = [
+    "const",
+    "gen_mesh",
+    "mask_afford",
+    "diffpd_2d_candi_contact"
+]

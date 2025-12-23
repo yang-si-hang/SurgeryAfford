@@ -6,15 +6,69 @@ from typing import List
 import numpy as np
 import cv2
 import matplotlib.pyplot as plt
+from scipy.spatial import ConvexHull
+from shapely.geometry import Polygon, Point
+import shapely
 import taichi as ti
 ti.init(arch=ti.cpu, debug=True, default_fp=ti.f64)
 
-from const import OUTPUT_DIR
+from const import OUTPUT_DIR, MESH_DIR
 from gen_mesh import MaskTo2DMesh
 from diffpd_2d_candi_contact import Soft2DNocontact
-from utilize.mesh_util import \
-    read_mshv2_triangular, mesh_obj_tri, write_mshv2_triangular, \
-    find_boundary_node_indices
+from utilize.mesh_io import read_mshv2_triangular, write_mshv2_triangular
+from utilize.mesh_util import mesh_obj_tri, find_boundary_node_indices
+
+def build_convex_hull_polygon(points: np.ndarray) -> Polygon:
+    """
+    接收一个 (N, 2) 的点集，计算它们的凸包，并返回一个 Shapely 的 Polygon 对象。
+
+    Args:
+        points: 形状为 (N, 2)，代表 N 个二维点。
+
+    Returns:
+        shapely.geometry.Polygon: 一个代表点集凸包的多边形对象。
+    """
+    if points.shape[0] < 3:
+        raise ValueError(f"至少需要3个点来构建凸包，但只收到了 {points.shape[0]} 个。")
+        
+    try:
+        # 1. 使用 SciPy 计算凸包
+        hull = ConvexHull(points)
+        
+        # 2. 提取凸包的顶点坐标 (按顺序)
+        hull_vertices = points[hull.vertices]
+        hull_polygon = Polygon(hull_vertices)   # 3. 使用 Shapely 创建多边形对象
+        
+        return hull_polygon
+        
+    except Exception as e:
+        print(f"构建凸包时出错: {e}")   # 在 QHull 错误时 (例如所有点共线) 返回空
+        return Polygon()
+
+def calculate_distances_to_hull(hull_polygon: Polygon, 
+                                query_points: np.ndarray) -> np.ndarray:
+    """
+    计算一个或多个点到预先计算好的凸包多边形的距离。
+    - 如果点在凸包内部或边界上，距离为 0。
+    - 如果点在凸包外部，距离为最短欧几里得距离。
+
+    Args:
+        hull_polygon: 从 build_convex_hull_polygon() 得到的凸包对象。
+        query_points: 一个 NumPy 数组，形状为 (K, 2)，代表 K 个要查询的点。
+
+    Returns:
+        np.ndarray: 一个形状为 (K,) 的数组，包含每个点到凸包的距离。
+    """
+    # 1. 将 (K, 2) 的 NumPy 数组转换为 Shapely 的点数组。(这比用 for 循环创建 Point() 对象快得多)
+    shapely_points = shapely.points(query_points)
+    
+    # 2. 矢量化计算所有点到多边形的距离
+    #    shapely.distance() 自动处理内部/外部点：
+    #    - 内部点 -> 0.0
+    #    - 外部点 -> 最短距离
+    distances = shapely.distance(hull_polygon, shapely_points)
+    
+    return distances
 
 @ti.data_oriented
 class Soft2D(Soft2DNocontact):
@@ -24,11 +78,43 @@ class Soft2D(Soft2DNocontact):
         self.candi_contact = candi_contact
         self.CON_N:int = 1
         self.contact_particle_ti = ti.field(dtype=ti.i32, shape=self.CON_N)
+        self.control_hull = dict()
+        self.construct_control_convexhull()
 
         self.precomputation()
         self.substep(0)
         self.construct_g_hessian()
         self.A_pre, self.B_pre = self.model_gradient_const()
+
+    def construct_control_convexhull(self):
+        """ 构建控制点的凸包多边形，用于后续距离计算
+        """
+        candi_contact = self.candi_contact
+        fix = self.fix_particle_list
+        node_np = self.node_pos.to_numpy()
+        fix_pos = node_np[fix]
+        for i, idx in enumerate(candi_contact):
+            all_points = np.vstack([fix_pos, node_np[idx]])
+            hull_polygon = build_convex_hull_polygon(all_points)
+            self.control_hull[idx] = hull_polygon
+
+    def construct_controllability(self, contact_idx, query_points:np.ndarray):
+        """ 计算控制点对query_points的可控性，基于距离的反比
+        Args:
+            query_points: np.ndarray, (M, 2) M为查询点数量。查询点的位置。
+        Returns:
+            controlability: np.ndarray, (M, ) control convexhull对查询点的可控性矩阵
+        """
+        s = 1.e-1  # 控制距离与可控性之间的比例系数。TODO：需要多次调整
+        M = query_points.shape[0]
+        controlability = np.zeros((M,), dtype=np.float64)
+
+        hull_polygon = self.control_hull[contact_idx]
+        distances = calculate_distances_to_hull(hull_polygon, query_points)
+        # 转化为可控性值，距离越近可控性越高
+        controlability = 1.0 / (s * distances + 1.)
+
+        return controlability
 
     def model_gradient(self, contact_idx:int):
         """ 直接将contact相关的项加到A_pre和B_pre上，得到最终的A和B矩阵
@@ -77,8 +163,10 @@ class Soft2D(Soft2DNocontact):
 
         loss, grad = self.construct_loss_gradient(feature_pos)
         for i, idx in enumerate(candi_contact):
+            controllability = self.construct_controllability(idx, feature_pos)
+            controllability_matrix = np.kron(np.diag(controllability), np.eye(2))  # (2M, 2M)
             dq_dcontact = self.model_gradient(idx)
-            dloss_dcontact = grad @ points_j @ dq_dcontact  # 链式法则
+            dloss_dcontact = grad @ controllability_matrix @ points_j @ dq_dcontact  # 链式法则
             afford = np.linalg.norm(dloss_dcontact)
             results[idx] = afford
             afford_vec[i] = dloss_dcontact
@@ -119,8 +207,8 @@ if __name__ == "__main__":
 
         print(f"Nodes num: {V.shape[0]}; Faces num: {F.shape[0]}")
 
-        write_mshv2_triangular(f"{OUTPUT_DIR}/mesh/output_mesh.msh", np.array(V), np.array(F))
-        print(f"网格已保存为 '{OUTPUT_DIR}/mesh/output_mesh.msh'。")
+        write_mshv2_triangular(f"{MESH_DIR}/output_mesh.msh", np.array(V), np.array(F))
+        print(f"网格已保存为 '{MESH_DIR}/output_mesh.msh'。")
 
         # 处理缝合线输入
         suture_start = np.array([300.0, 140.0])
@@ -141,7 +229,7 @@ if __name__ == "__main__":
         # print(f"Boundary node indices: {boundary_node_indices}")
 
         # 构建变形模型，计算candidate contact的affordance
-        mesh_file = OUTPUT_DIR / "mesh/output_mesh.msh"
+        mesh_file = MESH_DIR / "output_mesh.msh"
         soft_model = Soft2D(shape=mesh_file, fix=fixed_nodes_idx_flat, candi_contact=boundary_node_indices,
                             E=1.e6, nu=0.3, dt=1.e-2, density=1.e-2)    # 注意长度单位改变后的杨氏模量尺度
 
