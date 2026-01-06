@@ -13,8 +13,8 @@ import taichi as ti
 ti.init(arch=ti.cpu, debug=True, default_fp=ti.f64)
 
 from const import OUTPUT_DIR, MESH_DIR
-from gen_mesh import MaskTo2DMesh
-from diffpd_2d_candi_contact import Soft2DNocontact
+from utilize.gen_mesh import MaskTo2DMesh
+from deformation_model.diffpd_2d_candi_contact import Soft2DNocontact
 from utilize.mesh_io import read_mshv2_triangular, write_mshv2_triangular
 from utilize.mesh_util import mesh_obj_tri, find_boundary_node_indices
 

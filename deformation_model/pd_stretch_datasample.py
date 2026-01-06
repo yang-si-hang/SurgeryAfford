@@ -4,33 +4,68 @@ Modified to save HDF5 data
 
 Date: 2025-11-20
 """
+import cv2
 import numpy as np
 from scipy import sparse
 import h5py
 from pathlib import Path
 import taichi as ti
 
-from const import DATA_DIR, OUTPUT_DIR, ROOT_DIR
+from const import DATA_DIR, OUTPUT_DIR, ROOT_DIR, MESH_DIR
+from utilize.gen_mesh import MaskTo2DMesh
 from deformation_model.diffpd_2d import Soft2D
 from utilize.mesh_io import read_mshv2_triangular, write_mshv2_triangular
+from datetime import datetime
 
+TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
+Path(f"{OUTPUT_DIR}/{TIMESTAMP}").mkdir(parents=True, exist_ok=True)
+
+
+def generate_mesh_and_exit():
+    """ 生成mesh并退出，后续仿真直接使用msh文件 """
+    FACTOR = 1.e-3
+
+    # 使用确定的mask生成mesh
+    H, W = 512, 512
+    mask = np.zeros((H, W), dtype=np.uint8)
+    cv2.rectangle(mask, (100, 100), (200, 200), 1, -1)
+    data_mesher = MaskTo2DMesh(boundary_resolution=60, mesh_max_area=50, mesh_min_angle=25)
+
+    print(f"="*10+" Generating mesh from mask... "+"="*10)
+    V, F = data_mesher.generate_mesh(mask)
+    V = V * FACTOR  # 缩放到合适尺寸
+    E = data_mesher.E # 边界点索引
+    mesh_file = f"{MESH_DIR}/pd_stretch_demo_mesh_init.msh"
+    write_mshv2_triangular(f"{mesh_file}", V, F)
+    print(f"Mesh saved to {mesh_file} with {V.shape[0]} vertices and {F.shape[0]} faces.")
+    mesh_dict = {"V": V, "F": F, "E": E}
+    exit()
+
+# generate_mesh_and_exit()
 
 if __name__ == "__main__":
     ti.init(arch=ti.cuda, debug=True, default_fp=ti.f64)
 
-    contact_node = 120 # 77, 115， 120
+    # fix 和 contact的索引使用paraview可视化选择
+    mesh_file = f"{MESH_DIR}/pd_stretch_demo_mesh_init.msh"
+    fix_nodes = [0] + list(range(45, 60))
+    contact_node = 15
+    hard_ele_list = [151, 174, 176, 177, 178, 179, 182, 186, 218, 219, 220, 306]
 
-    soft = Soft2D(shape=[0.1, 0.1], fix=list(range(0, 11)), contact=contact_node,
-                        E=1.e3, nu=0.3, dt=1.e-2, density=1.e1)
-    
-    write_mshv2_triangular(f"{OUTPUT_DIR}/pd_contact{soft.contact_particle_list[0]}_step{0:03d}.msh",
-                           soft.node_pos.to_numpy(), soft.ele.to_numpy())
+    # 规则化配置，用于测试
+    # mesh_file = [0.1, 0.1]
+    # fix_nodes = list(range(0, 11))
+    # contact_node = 110
+    # hard_ele_list = []
+
+    # 读取网格文件
+    soft = Soft2D(shape=mesh_file, fix=fix_nodes, contact=contact_node,
+                        E=1.e3, nu=0.3, dt=1.e-2, density=1.e1, damp=1.e-4)
     
     # 增加不同的硬度区域
-    hard_ele_list = [120, 121, 122, 123, 132, 133, 136, 137]
     stretch_w_np = soft.stretch_weight.to_numpy()
     for e_i in hard_ele_list:
-        stretch_w_np[e_i] *= 100  # 初始拉伸权重调大一些，方便观察效果
+        stretch_w_np[e_i] *= 100
     soft.stretch_weight.from_numpy(stretch_w_np)
 
     soft.precomputation()
@@ -47,20 +82,21 @@ if __name__ == "__main__":
     }
 
     # 保存初始网格拓扑（只取一次即可，因为拓扑不变）
-    mesh_topology = soft.ele.to_numpy()
+    mesh_faces = soft.ele.to_numpy()
+    mesh_edges = soft.edge.to_numpy()
     mesh_rest_pos = soft.node_pos.to_numpy() # 初始位置
 
     print("Start Simulation & Data Collection...")
 
     for step in range(20):
-        print(f"Action step {step} -----")
+        print(f"Action step {step}"+"-"*10)
 
         q_tm1 = soft.node_pos.to_numpy()
-        action_value = np.array([1., 1.0]) * 0.001 / soft.dt
+        action_value = np.array([-1., 1.0]) * 0.001 / soft.dt
         current_action_idx = soft.contact_particle_list[0]
 
         # 此处要注意action与contact之间的对应
-        soft.contact_vel.from_numpy(np.array([[1., 1.0]]) * 0.001 / soft.dt)
+        soft.contact_vel.from_numpy(np.array([[-1., 1.0]]) * 0.001 / soft.dt)
         soft.substep(step_num=0)
 
         soft.contact_vel.fill(0.)
@@ -73,7 +109,7 @@ if __name__ == "__main__":
         q_t = soft.node_pos.to_numpy()
         nodes_force = soft.force.to_numpy()
 
-        write_mshv2_triangular(f"{OUTPUT_DIR}/pd_contact{soft.contact_particle_list[0]}_step{step+1:03d}.msh",
+        write_mshv2_triangular(f"{OUTPUT_DIR}/{TIMESTAMP}/pd_contact{soft.contact_particle_list[0]}_step{step+1:03d}.msh",
                                soft.node_pos.to_numpy(), soft.ele.to_numpy())
 
         # --- [存入 Buffer] ---
@@ -84,7 +120,7 @@ if __name__ == "__main__":
         data_buffer["forces_field"].append(nodes_force)
 
     # --- [保存为 HDF5] ---
-    h5_path = Path(DATA_DIR) / "demo" / "pd_stretch_data_hete" / "0.hdf5"
+    h5_path = Path(DATA_DIR) / "demo" / "pd_stretch_data_hete" / TIMESTAMP / "0.hdf5"
     h5_path.parent.mkdir(parents=True, exist_ok=True)
     h5_path = str(h5_path)
 
@@ -93,14 +129,19 @@ if __name__ == "__main__":
     with h5py.File(h5_path, 'w') as f:
         # 1. 保存通用的 Mesh 结构 (所有 step 共享)
         g_mesh = f.create_group('mesh_structure')
-        g_mesh.create_dataset('faces', data=mesh_topology, compression="gzip")
+        g_mesh.create_dataset('faces', data=mesh_faces, compression="gzip")
+        g_mesh.create_dataset('edges', data=mesh_edges, compression="gzip")
         g_mesh.create_dataset('rest_pos', data=mesh_rest_pos, compression="gzip")
-        
+        g_mesh.create_dataset('fix_nodes', data=np.array(fix_nodes), compression="gzip")
+        g_mesh.create_dataset('contact_nodes', data=np.array([contact_node]), compression="gzip")
+        g_mesh.create_dataset('stiffness_truth', data=soft.stiffness, compression="gzip")
+
         # 2. 保存仿真参数 (Metadata)
         f.attrs['E'] = 1.e3
         f.attrs['nu'] = 0.3
         f.attrs['dt'] = 1.e-2
         f.attrs['total_steps'] = len(data_buffer["q_prev"])
+        f.attrs['description'] = "Simulation of soft tissue stretching"
         
         # 3. 保存轨迹数据 (Converting lists to numpy arrays)
         # 最终 shape 示例: q_prev -> (20, N, 2)

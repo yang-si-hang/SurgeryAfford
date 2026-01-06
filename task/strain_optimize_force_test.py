@@ -21,7 +21,7 @@ import taichi as ti
 import matplotlib.pyplot as plt
 import matplotlib.tri as mtri
 
-from const import ROOT_DIR, MESH_DIR, OUTPUT_DIR, DATA_DIR, VISUALIZATION_DIR
+from const import ROOT_DIR, MESH_DIR, OUTPUT_DIR, DATA_DIR
 from deformation_model.diffpd_2d import Soft2D
 from utilize.mesh_io import read_mshv2_triangular, write_mshv2_triangular
 from utilize.mesh_util import extract_edge_from_face, mesh_obj_tri
@@ -73,112 +73,98 @@ class Soft2DForce(Soft2D):
 if __name__ == "__main__":
     ti.init(arch=ti.cuda, debug=True)
 
+    real_w, init_w = None, None  # 可以预设真实值和初始值
     lam = 1.e-6  # Hessian 正则化系数
 
     # load dataset #
-    demo_dir = DATA_DIR / "demo" / "pd_stretch_data_hete" / "20260106_112619"
+    demo_dir = DATA_DIR / "demo" / "pd_stretch_data" / "20260106_105928"
     dataset = HDF5PdDataset(data_directory=str(demo_dir))
-    print(f"数据集加载完成，共包含 {len(dataset)} 个样本。")
 
-    if len(dataset) == 0:
-        raise ValueError("Dataset is empty. Please check the data directory.")
-
-    MESH_DATA:dict = dataset.mesh_data
-    FIXED_NODES = dataset.static_data['fix_nodes'].tolist()
-    REAL_W = dataset.static_data['stiffness_truth']
-
-    NODE_NUM = MESH_DATA['V'].shape[0]
-    FACE_NUM = MESH_DATA['F'].shape[0]
-    OBSERVE_NODES = list(set(range(NODE_NUM)) - set(FIXED_NODES))
-    OBSERVE_DOFS = np.stack([np.array(OBSERVE_NODES) * 2, np.array(OBSERVE_NODES) * 2 + 1], axis=-1).flatten().tolist()
-
-    total_partial_g = np.zeros((FACE_NUM,))
-    total_hessian_g = np.zeros((FACE_NUM, FACE_NUM))
-    count_samples = 0
-    total_loss = 0.0
-
-    init_w_value = 450.0
-    init_w = init_w_value * torch.ones(FACE_NUM, device="cuda", dtype=torch.float64)
-    print(f"初始化刚度值: {init_w_value}")
-
-    model_cache = {}
+    target_step:int = 19
+    print(f"正在数据集中查找 Step {target_step} ...")
 
     target_idx_list = []
-    for i in range(len(dataset)):
-        sample = dataset[i]
+    for i, sample_meta in enumerate(dataset.samples):
+        # sample_meta 是加载到内存的原始字典 (numpy array格式)
+        
+        # 检查 step 是否匹配
+        # (如果你的 HDF5 文件不止一个，这里可能需要增加对 contact_idx 或 source_file 的判断，
+        #  否则它会返回第一个文件中的第 19 步)
+        if sample_meta['step_idx'] == target_step:
+            target_idx_list.append(i)
+            print(f"找到目标数据！索引: {i}")
+            print(f"来源文件: {sample_meta['source_file']}")
+            print(f"时间步: {sample_meta['step_idx']}")
+            print(f"Contact ID: {sample_meta['contact_idx']}")
+            # break
 
-        # if sample['step_idx'] != 19:
-        #     continue  # 只使用每个轨迹的最后一个时间步数据
+    if not target_idx_list:
+        raise IndexError(f"Target step {target_step} not found in dataset.")
 
-        contact_idx = int(sample['contact_idx'])
+    partial_g_list = []
+    hessian_g_list = []
+
+    for target_idx in target_idx_list:
+        sample = dataset[target_idx]      # (Dataset 会在这里把 numpy 转为 tensor)
+
+        contact_node = sample['contact_idx']  # 标量 Tensor 或 int
         pre_node_pos = sample['pre_x'].to('cuda')
         post_node_pos = sample['post_x'].to('cuda')
-        # action = sample['action'].to('cuda')
+        action = sample['action'].to('cuda')
         node_force = sample['force'].to('cuda')
 
-        if contact_idx not in model_cache:
-            # construct soft body model #
-            new_model = Soft2DForce(
-                shape=MESH_DATA, fix=FIXED_NODES, 
-                contact=contact_idx, E=1.e1, nu=0.3, dt=1.e-2, density=1.e1, device="cuda"
-            )
-            new_model.reconstruct_stretch_weight(init_w)
-            new_model.precomputation()
+        print("\n数据加载成功:")
+        print(f"  Pre Pos Shape: {pre_node_pos.shape}")
+        print(f"  Action: {action}")
 
-            model_cache[contact_idx] = new_model
+        # construct soft body model #
+        soft_model = Soft2DForce(
+            shape=[0.1, 0.1], fix=list(range(0, 11)), 
+            contact=contact_node, E=1.e1, nu=0.3, dt=1.e-2, density=1.e1, device="cuda"
+        )
 
-        soft_model = model_cache[contact_idx]
+        real_w = 1000 / 2 / 1.3 * 1.e-4 * torch.ones(soft_model.ELEMENT_N, device="cuda", dtype=torch.float64) if real_w is None else real_w
+        init_w = 450 * torch.ones(soft_model.ELEMENT_N, device="cuda", dtype=torch.float64) if init_w is None else init_w
+
+        soft_model.reconstruct_stretch_weight(init_w)
+        soft_model.precomputation()
 
         soft_model.node_pos.from_numpy(pre_node_pos[:, 0:2].cpu().numpy())
-
-        # forward: Deformation gradient and internal force #
         soft_model.cal_deformation_gradient()
         soft_model.update_internal_force()
-
-        # backward: gradient of internal force wrt. stretch weight #
         soft_model.cal_internal_force_gradient()
 
         internal_force = soft_model.force.to_numpy()
         dforce_dw = soft_model.dforce_dw.to_numpy()  # shape: [N*2, E]
+        dforce_dw_observe = dforce_dw[11*2:,:]    # 去掉固定节点的部分
 
-        dforce_dw_observe = dforce_dw[OBSERVE_DOFS,:]    # 去掉固定节点的部分
-        force_residual = internal_force[OBSERVE_NODES,:] - node_force.cpu().numpy()[OBSERVE_NODES,:]  # shape: [N - fixed_N, 2]
-        residual_flat = force_residual.flatten()
+        force_residual = internal_force[11:,:] - node_force.cpu().numpy()[11:,:]  # shape: [N*2 - fixed_N*2, 2]
+        loss = np.sum(force_residual**2)
 
-        current_loss = np.sum(force_residual**2)
-        print(f"Sample {i} (Contact {contact_idx}): Loss = {current_loss:.4e}")
-        
-        current_partial_g = 2 * residual_flat @ dforce_dw_observe  # shape: [E,]
-        current_hessian_g = 2 * dforce_dw_observe.T @ dforce_dw_observe  # shape: [E, E]
-
-        total_partial_g += current_partial_g
-        total_hessian_g += current_hessian_g
-        total_loss += current_loss
-        count_samples += 1
-
-    print(f"\n数据处理完毕，共聚合 {count_samples} 个样本。开始求解线性方程组...")
-
-    avg_partial_g = total_partial_g / count_samples
-    avg_hessian_g = total_hessian_g / count_samples
-
-    # H_new = H + lambda * I
-    hessian_reg = avg_hessian_g + np.eye(FACE_NUM) * lam
-
-    # Solve: (H + lam*I) * delta_w = -g
-    delta_w = - np.linalg.solve(avg_hessian_g, avg_partial_g)
-    updated_w = soft_model.stretch_weight.to_numpy() + delta_w
+        partial_g = 2 * force_residual.flatten() @ dforce_dw_observe  # shape: [E,]
+        hessian_g = 2 * dforce_dw_observe.T @ dforce_dw_observe  # shape: [E, E]
     
-    # analyse results #
+        partial_g_list.append(partial_g)
+        hessian_g_list.append(hessian_g)
+
+    # aggregate gradients from multiple contacts (if any) #
+    partial_g = np.mean(np.stack(partial_g_list, axis=0), axis=0)
+    hessian_g = np.mean(np.stack(hessian_g_list, axis=0), axis=0)
+    hessian_g_new = hessian_g + np.eye(soft_model.ELEMENT_N) * lam
+
+    delta_w = - np.linalg.solve(hessian_g, partial_g)
+    updated_w = soft_model.stretch_weight.to_numpy() + delta_w
     update_w_mean = np.mean(updated_w)
-    resolution_mat = np.linalg.inv(hessian_reg) @ total_hessian_g
+    resolution_mat = np.linalg.inv(hessian_g_new) @ hessian_g
+
     problematic_indices = np.where(np.diag(resolution_mat)<0.6)[0]
 
     np.savetxt(f"stretch_weight_update.csv", updated_w, fmt="%.6f", delimiter=',')
     np.savetxt(f"dforce_dw.csv", dforce_dw, fmt="%.6f", delimiter=',')
-    np.savetxt(f"hessian_g.csv", total_hessian_g, fmt="%.6f", delimiter=',')
-    np.savetxt(f"hessian_g_inv.csv", np.linalg.inv(total_hessian_g), fmt="%.6f", delimiter=',')
+    np.savetxt(f"hessian_g.csv", hessian_g, fmt="%.6f", delimiter=',')
+    np.savetxt(f"hessian_g_inv.csv", np.linalg.inv(hessian_g), fmt="%.6f", delimiter=',')
     np.savetxt(f"resolution_mat.csv", np.diag(resolution_mat), fmt="%.6f", delimiter=',')
-    print(f"Loss: {total_loss:.6e}")
+    print(f"Loss: {loss:.6e}")
     print(f"Upated stretch weights (first 10): {updated_w[:10]}")
     print(f"Updated weight mean: {update_w_mean:.6f}")
     print(f"Problematic indices (resolution < 0.6): {problematic_indices}")
@@ -206,11 +192,11 @@ if __name__ == "__main__":
     plt.gca().set_aspect("equal", adjustable="box")
     plt.xlabel("x")
     plt.ylabel("y")
-    plt.title(f"Internal Force Field")
+    plt.title(f"Internal Force Field (step {target_step})")
     plt.legend()
     plt.tight_layout()
     
-    out_path = Path(VISUALIZATION_DIR) / f"internal_force.svg"
+    out_path = Path(OUTPUT_DIR) / f"internal_force_step{target_step:03d}.svg"
     plt.savefig(out_path, dpi=200)
     plt.close()
     print(f"Saved internal force visualization to {out_path}")
@@ -231,9 +217,9 @@ if __name__ == "__main__":
     plt.gca().set_aspect('equal')
     plt.xlabel('x')
     plt.ylabel('y')
-    plt.title(f'Stiffness per Element')
+    plt.title(f'Stiffness per Element (step {target_step})')
 
-    out_path_stiff = Path(VISUALIZATION_DIR) / f"stiffness.svg"
+    out_path_stiff = Path(OUTPUT_DIR) / f"stiffness_step{target_step:03d}.svg"
     plt.savefig(out_path_stiff, dpi=200)
     plt.close()
     print(f"Saved stiffness visualization to {out_path_stiff}")
@@ -247,12 +233,12 @@ if __name__ == "__main__":
     soft_model.update_internal_force()
 
     internal_force_update = soft_model.force.to_numpy()
-    loss_new = np.sum((internal_force_update[OBSERVE_NODES,:] - node_force.cpu().numpy()[OBSERVE_NODES,:])**2)
-    cov_mat = loss_new/(len(OBSERVE_NODES)*2-FACE_NUM)*np.linalg.inv(total_hessian_g)
+    loss_new = np.sum((internal_force_update[11:,:] - node_force.cpu().numpy()[11:,:])**2)
+    cov_mat = loss_new/(110*2-200)*np.linalg.inv(hessian_g)
     dev = np.diag(cov_mat)
     uncertainty_abs = np.sqrt(np.diag(cov_mat))
     uncertainty_rel = uncertainty_abs / updated_w
-    uncertainty_rel_real = (updated_w - REAL_W) / REAL_W
+    uncertainty_rel_real = (updated_w - real_w.cpu().numpy()) / real_w.cpu().numpy()
 
     print(f"New Loss after update: {loss_new:.6e}")
     np.savetxt(f"dev.csv", dev, fmt="%.6f", delimiter=',')

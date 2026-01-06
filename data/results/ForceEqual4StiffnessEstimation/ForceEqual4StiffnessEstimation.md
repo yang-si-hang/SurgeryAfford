@@ -16,3 +16,11 @@
 - 基于内力-外力平衡方程（准静态过程），使用Newton-Raphson迭代方法求解（只用一次迭代）
 
 - 使用Resolution Matrix评估各个单元格参数辨识的不确定性（图中深蓝色区域为不确定性高的区域）
+
+**2026-1-6**
+
+- 使用opencv的mask，构建了不规则的mesh网格，并使用一组完整的轨迹。
+
+- 边界上的奇异单元不可被辨识，这是mesh划分存在的问题
+
+![alt text](stiffness_general_mesh.svg)

@@ -66,14 +66,14 @@ class Soft2D:
                  E:float, nu:float, dt:float, density:float, **kwargs):
         self.shape = shape
 
-        if isinstance(self.shape, Path):
+        if isinstance(self.shape, Path) or isinstance(self.shape, str):
             node_np, ele_np = read_mshv2_triangular(self.shape)
             edge_np = extract_edge_from_face(ele_np)
         elif isinstance(self.shape, List):
             node_np, edge_np, ele_np = mesh_obj_tri(self.shape, 0.01)
             # node_np_3d = np.hstack((node_np, np.zeros((node_np.shape[0], 1))))
 
-            msh_file:str = MESH_DIR / "shape.msh"
+            msh_file:str = MESH_DIR / "diffpd_2d_shape_init.msh"
             write_mshv2_triangular(msh_file, node_np, ele_np)
         elif isinstance(self.shape, dict):
             node_np = np.array(self.shape['V'])
@@ -160,6 +160,13 @@ class Soft2D:
 
         print(f"Particle numer: {self.PARTICLE_N}; Edge number: {self.EDGE_N}; Element number: {self.ELEMENT_N}")
         print(f"Positional weight: {self.positional_weight:.3f}")
+
+    @property
+    def stiffness(self):
+        stretch_weight = self.stretch_weight.to_numpy()
+        ele_volume_np = self.ele_volume.to_numpy()
+
+        return stretch_weight / ele_volume_np
 
     @ti.kernel
     def construct_mass(self):

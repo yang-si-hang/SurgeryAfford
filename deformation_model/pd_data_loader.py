@@ -31,8 +31,15 @@ class HDF5PdDataset(Dataset):
         super().__init__()
         self.data_directory = Path(data_directory)
         self.samples = []
-        self.static_faces = None  # 存储网格拓扑 (所有样本共享)
-        self.static_rest_pos = None # 存储初始位置
+        self.mesh_data = {
+            'F': None,
+            'E': None,
+            'V': None,
+        }
+        self.static_data = {
+            'fix_nodes': None,
+            'stiffness_truth': None
+        }
         
         # 扫描所有 h5 文件
         h5_files = list(self.data_directory.rglob('*.hdf5'))
@@ -55,16 +62,24 @@ class HDF5PdDataset(Dataset):
         """读取单个 HDF5 文件并提取数据"""
         # 使用 'r' 模式读取
         with h5py.File(file_path, 'r') as f:
-            # 1. 读取静态网格信息 (假设所有文件的网格拓扑是一样的，只存一份即可)
-            if self.static_faces is None:
-                if 'mesh_structure' in f:
-                    self.static_faces = f['mesh_structure/faces'][:]
-                    self.static_rest_pos = f['mesh_structure/rest_pos'][:]
+            # 1. 读取静态网格信息 (仅在第一次读取时加载)
+            if self.mesh_data['F'] is None:
+                g_mesh = f['mesh_structure']
+                self.mesh_data['F'] = g_mesh['faces'][:]
+                self.mesh_data['E'] = g_mesh['edges'][:]
+                self.mesh_data['V'] = g_mesh['rest_pos'][:]
+
+                self.static_data['fix_nodes'] = g_mesh['fix_nodes'][:]
+                self.static_data['stiffness_truth'] = g_mesh['stiffness_truth'][:]
+                
+                # 读取全局属性
+                self.E = f.attrs.get('E', None)
+                self.nu = f.attrs.get('nu', None)
             
+            current_contact_node = f['mesh_structure/contact_nodes'][:]
+
             # 2. 获取轨迹数据组
             grp = f['trajectories']
-            
-            # 获取数据长度 (Time steps)
             num_steps = grp['q_prev'].shape[0]
             
             if load_to_ram:
@@ -88,9 +103,11 @@ class HDF5PdDataset(Dataset):
                     })
             else:
                 # 如果数据极大，无法放入内存，则只存索引
-                # (filepath, index_in_file)
                 for t in range(num_steps):
-                    self.samples.append((str(file_path), t))
+                    self.samples.append({
+                        'file_info': (str(file_path), t),
+                        'contact_node': current_contact_node 
+                    })
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -112,7 +129,8 @@ class HDF5PdDataset(Dataset):
                     'post_x': torch.tensor(grp['q_curr'][t], dtype=torch.float32),
                     'action': torch.tensor(grp['action_val'][t], dtype=torch.float32),
                     'contact_idx': int(grp['action_idx'][t]), 
-                    'force': torch.tensor(grp['action_force'][t], dtype=torch.float32)
+                    'force': torch.tensor(grp['action_force'][t], dtype=torch.float32),
+                    'step_idx': torch.tensor(t, dtype=torch.long),
                 }
                 return item
 
@@ -127,18 +145,9 @@ class HDF5PdDataset(Dataset):
             'post_x': torch.tensor(sample_data['post_x'], dtype=torch.float32),
             'action': torch.tensor(sample_data['action'], dtype=torch.float32),
             'contact_idx': torch.tensor(c_idx, dtype=torch.long), # 索引通常用 long
-            'force': torch.tensor(sample_data['force'], dtype=torch.float32)
+            'force': torch.tensor(sample_data['force'], dtype=torch.float32),
+            'step_idx': torch.tensor(sample_data['step_idx'], dtype=torch.long),
         }
-
-    def get_mesh_topology(self):
-        """
-        获取静态的网格连接关系 (Faces) 和 初始位置。
-        这对于构建 Graph (Edge Index) 非常有用，不需要在每个 Batch 里重复返回。
-        """
-        if self.static_faces is None:
-            raise ValueError("未找到网格拓扑数据，请检查 HDF5 文件中是否包含 'mesh_structure' 组")
-        return torch.tensor(self.static_rest_pos, dtype=torch.float32), \
-               torch.tensor(self.static_faces, dtype=torch.long)
 
 
 # ========== DataLoader 创建函数 ==========

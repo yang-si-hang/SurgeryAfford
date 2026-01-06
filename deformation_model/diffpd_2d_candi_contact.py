@@ -13,8 +13,7 @@ ti.init(arch=ti.cpu, debug=True, default_fp=ti.f64)
 
 from const import ROOT_DIR, OUTPUT_DIR
 from utilize.mesh_io import read_mshv2_triangular, write_mshv2_triangular
-from utilize.mesh_util import mesh_obj_tri
-from deformation_model.diffpd_2d import read_msh
+from utilize.mesh_util import mesh_obj_tri, extract_edge_from_face
 
 @ti.data_oriented
 class Soft2DNocontact:
@@ -23,7 +22,8 @@ class Soft2DNocontact:
                  E:float, nu:float, dt:float, density:float, **kwargs):
         self.shape = shape
         if isinstance(self.shape, Path):
-            node_np, edge_np, ele_np = read_msh(self.shape)
+            node_np, ele_np = read_mshv2_triangular(self.shape)
+            edge_np = extract_edge_from_face(ele_np)
         elif isinstance(self.shape, List):
             node_np, edge_np, ele_np = mesh_obj_tri(self.shape, 0.01)
 
