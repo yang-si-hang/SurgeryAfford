@@ -51,6 +51,7 @@ if __name__ == "__main__":
     fix_nodes = [0] + list(range(45, 60))
     contact_node = 15
     hard_ele_list = [151, 174, 176, 177, 178, 179, 182, 186, 218, 219, 220, 306]
+    free_ele_list = [201, 203, 223, 227, 240, 241]
 
     # 规则化配置，用于测试
     # mesh_file = [0.1, 0.1]
@@ -66,6 +67,8 @@ if __name__ == "__main__":
     stretch_w_np = soft.stretch_weight.to_numpy()
     for e_i in hard_ele_list:
         stretch_w_np[e_i] *= 100
+    for e_i in free_ele_list:
+        stretch_w_np[e_i] *= 0.01
     soft.stretch_weight.from_numpy(stretch_w_np)
 
     soft.precomputation()
@@ -134,7 +137,9 @@ if __name__ == "__main__":
         g_mesh.create_dataset('rest_pos', data=mesh_rest_pos, compression="gzip")
         g_mesh.create_dataset('fix_nodes', data=np.array(fix_nodes), compression="gzip")
         g_mesh.create_dataset('contact_nodes', data=np.array([contact_node]), compression="gzip")
-        g_mesh.create_dataset('stiffness_truth', data=soft.stiffness, compression="gzip")
+        g_mesh.create_dataset('hard_ele_idx', data=np.array(hard_ele_list), compression="gzip")
+        g_mesh.create_dataset('free_ele_idx', data=np.array(free_ele_list), compression="gzip")
+        g_mesh.create_dataset('stiffness_truth', data=soft.stretch_weight.to_numpy(), compression="gzip")
 
         # 2. 保存仿真参数 (Metadata)
         f.attrs['E'] = 1.e3

@@ -32,32 +32,6 @@ from const import ROOT_DIR, MESH_DIR
 from utilize.mesh_io import read_mshv2_triangular, write_mshv2_triangular
 from utilize.mesh_util import extract_edge_from_face, mesh_obj_tri
 
-# def read_msh(file:str):
-#     nodes, faces = read_mshv2_triangular(file)
-
-#     # 构建边列表
-#     edges = []
-#     for face in faces:
-#         edge1 = sorted([face[0], face[1]])
-#         edge2 = sorted([face[1], face[2]])
-#         edge3 = sorted([face[2], face[0]])
-        
-#         edges.append(edge1)
-#         edges.append(edge2)
-#         edges.append(edge3)
-    
-#     # Remove duplicate edges by converting to tuples, using a set, then back to list
-#     unique_edges = []
-#     edge_set = set()
-#     for edge in edges:
-#         edge_tuple = tuple(edge)
-#         if edge_tuple not in edge_set:
-#             edge_set.add(edge_tuple)
-#             unique_edges.append(edge)
-    
-#     edges = np.array(unique_edges, dtype=int)
-
-#     return nodes, edges, faces
 
 @ti.data_oriented
 class Soft2D:

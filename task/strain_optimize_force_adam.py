@@ -13,7 +13,7 @@ Date: 2025-12-17
 """
 import time
 from pathlib import Path
-from typing import List
+from typing import List, Dict
 import numpy as np
 from scipy import sparse
 import torch
@@ -76,7 +76,7 @@ if __name__ == "__main__":
     lam = 1.e-6  # Hessian 正则化系数
 
     # load dataset #
-    demo_dir = DATA_DIR / "demo" / "pd_stretch_data_hete" / "20260106_112619"
+    demo_dir = DATA_DIR / "demo" / "pd_stretch_data_hete" / "20260106_123028"
     dataset = HDF5PdDataset(data_directory=str(demo_dir))
     print(f"数据集加载完成，共包含 {len(dataset)} 个样本。")
 
@@ -86,6 +86,8 @@ if __name__ == "__main__":
     MESH_DATA:dict = dataset.mesh_data
     FIXED_NODES = dataset.static_data['fix_nodes'].tolist()
     REAL_W = dataset.static_data['stiffness_truth']
+    hard_ele_list = dataset.static_data['hard_ele_idx'].tolist()
+    free_ele_list = dataset.static_data['free_ele_idx'].tolist()
 
     NODE_NUM = MESH_DATA['V'].shape[0]
     FACE_NUM = MESH_DATA['F'].shape[0]
@@ -101,7 +103,7 @@ if __name__ == "__main__":
     init_w = init_w_value * torch.ones(FACE_NUM, device="cuda", dtype=torch.float64)
     print(f"初始化刚度值: {init_w_value}")
 
-    model_cache = {}
+    model_cache: Dict[int, Soft2DForce] = {}
 
     target_idx_list = []
     for i in range(len(dataset)):
@@ -112,7 +114,7 @@ if __name__ == "__main__":
 
         contact_idx = int(sample['contact_idx'])
         pre_node_pos = sample['pre_x'].to('cuda')
-        post_node_pos = sample['post_x'].to('cuda')
+        post_node_pos = sample['post_x'][:, :2].to('cuda')
         # action = sample['action'].to('cuda')
         node_force = sample['force'].to('cuda')
 
@@ -129,7 +131,8 @@ if __name__ == "__main__":
 
         soft_model = model_cache[contact_idx]
 
-        soft_model.node_pos.from_numpy(pre_node_pos[:, 0:2].cpu().numpy())
+        # soft_model.node_pos.from_numpy(pre_node_pos[:, 0:2].cpu().numpy())
+        soft_model.node_pos.from_torch(post_node_pos)
 
         # forward: Deformation gradient and internal force #
         soft_model.cal_deformation_gradient()
@@ -167,11 +170,17 @@ if __name__ == "__main__":
     # Solve: (H + lam*I) * delta_w = -g
     delta_w = - np.linalg.solve(avg_hessian_g, avg_partial_g)
     updated_w = soft_model.stretch_weight.to_numpy() + delta_w
+
+    # print hard and free element stiffness #
+    print("\n刚度值更新完毕，部分单元刚度值如下：")
+    print(f"hard elements: {updated_w[hard_ele_list]}")
+    print(f"free elements: {updated_w[free_ele_list]}")
     
     # analyse results #
     update_w_mean = np.mean(updated_w)
     resolution_mat = np.linalg.inv(hessian_reg) @ total_hessian_g
     problematic_indices = np.where(np.diag(resolution_mat)<0.6)[0]
+    rel_error = np.abs(REAL_W - updated_w) / REAL_W
 
     np.savetxt(f"stretch_weight_update.csv", updated_w, fmt="%.6f", delimiter=',')
     np.savetxt(f"dforce_dw.csv", dforce_dw, fmt="%.6f", delimiter=',')

@@ -38,7 +38,9 @@ class HDF5PdDataset(Dataset):
         }
         self.static_data = {
             'fix_nodes': None,
-            'stiffness_truth': None
+            'stiffness_truth': None,
+            'hard_ele_idx': None,
+            'free_ele_idx': None,
         }
         
         # 扫描所有 h5 文件
@@ -71,6 +73,8 @@ class HDF5PdDataset(Dataset):
 
                 self.static_data['fix_nodes'] = g_mesh['fix_nodes'][:]
                 self.static_data['stiffness_truth'] = g_mesh['stiffness_truth'][:]
+                self.static_data['hard_ele_idx'] = g_mesh['hard_ele_idx'][:]
+                self.static_data['free_ele_idx'] = g_mesh['free_ele_idx'][:]
                 
                 # 读取全局属性
                 self.E = f.attrs.get('E', None)
