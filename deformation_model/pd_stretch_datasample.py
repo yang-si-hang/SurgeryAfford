@@ -1,6 +1,8 @@
 """ 使用pd采集不同的attachment节点的stretch数据；
 增加静止时间步，确保稳态数据
 Modified to save HDF5 data
+Changelog:
+    - 2025-01-12: 增加噪声采集
 
 Date: 2025-11-20
 """
@@ -20,6 +22,10 @@ from datetime import datetime
 TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
 Path(f"{OUTPUT_DIR}/{TIMESTAMP}").mkdir(parents=True, exist_ok=True)
 
+NOISE_CFG = {
+    "pos_sigma": 1.e-5,    # 位置传感标准差
+    "force_sigma": 1.e-1,  # 力传感标准差
+}
 
 def generate_mesh_and_exit():
     """ 生成mesh并退出，后续仿真直接使用msh文件 """
@@ -35,10 +41,13 @@ def generate_mesh_and_exit():
     V, F = data_mesher.generate_mesh(mask)
     V = V * FACTOR  # 缩放到合适尺寸
     E = data_mesher.E # 边界点索引
+    neighbors = data_mesher.neighbors
     mesh_file = f"{MESH_DIR}/pd_stretch_demo_mesh_init.msh"
     write_mshv2_triangular(f"{mesh_file}", V, F)
     print(f"Mesh saved to {mesh_file} with {V.shape[0]} vertices and {F.shape[0]} faces.")
-    mesh_dict = {"V": V, "F": F, "E": E}
+    np.savetxt(f"{MESH_DIR}/pd_stretch_demo_mesh_neighbors.csv", neighbors, fmt="%d", delimiter=",")
+    print(f"Neighbors info saved in {MESH_DIR}/pd_stretch_demo_mesh_neighbors.csv")
+    mesh_dict = {"V": V, "F": F, "E": E, "neighbors": neighbors}
     exit()
 
 # generate_mesh_and_exit()
@@ -48,8 +57,8 @@ if __name__ == "__main__":
 
     # fix 和 contact的索引使用paraview可视化选择
     mesh_file = f"{MESH_DIR}/pd_stretch_demo_mesh_init.msh"
-    fix_nodes = [0] + list(range(45, 60))
-    contact_node = 15
+    fix_nodes = [0] + list(range(45, 60)) + [23]
+    contact_node = 36   # 22, 15, 8, 37, 30
     hard_ele_list = [151, 174, 176, 177, 178, 179, 182, 186, 218, 219, 220, 306]
     free_ele_list = [201, 203, 223, 227, 240, 241]
 
@@ -77,7 +86,7 @@ if __name__ == "__main__":
     soft.pre_fact_lhs_solve = sparse.linalg.factorized(s_lhs_np)
 
     data_buffer = {
-        "q_prev": [],
+        # "q_prev": [],
         "q_curr": [],
         "action_val": [],
         "action_idx": [],
@@ -91,15 +100,15 @@ if __name__ == "__main__":
 
     print("Start Simulation & Data Collection...")
 
-    for step in range(20):
+    for step in range(10):
         print(f"Action step {step}"+"-"*10)
 
         q_tm1 = soft.node_pos.to_numpy()
-        action_value = np.array([-1., 1.0]) * 0.001 / soft.dt
+        action_value = np.array([1.0, .0]) * 0.002 / soft.dt
         current_action_idx = soft.contact_particle_list[0]
 
-        # 此处要注意action与contact之间的对应
-        soft.contact_vel.from_numpy(np.array([[-1., 1.0]]) * 0.001 / soft.dt)
+        # 此处要注意action与contact之间的
+        soft.contact_vel.from_numpy(np.array([[1.0, .0]]) * 0.002 / soft.dt)
         soft.substep(step_num=0)
 
         soft.contact_vel.fill(0.)
@@ -112,15 +121,21 @@ if __name__ == "__main__":
         q_t = soft.node_pos.to_numpy()
         nodes_force = soft.force.to_numpy()
 
-        write_mshv2_triangular(f"{OUTPUT_DIR}/{TIMESTAMP}/pd_contact{soft.contact_particle_list[0]}_step{step+1:03d}.msh",
-                               soft.node_pos.to_numpy(), soft.ele.to_numpy())
+        pos_noise = np.random.randn(*q_t.shape) * NOISE_CFG["pos_sigma"]
+        q_t_noise = q_t.copy() + pos_noise
+
+        nodes_force_noise = nodes_force.copy()
+        nodes_force_noise[contact_node, :] += np.random.randn(2) * NOISE_CFG["force_sigma"]
 
         # --- [存入 Buffer] ---
-        data_buffer["q_prev"].append(q_tm1)
-        data_buffer["q_curr"].append(q_t)
+        # data_buffer["q_prev"].append(q_tm1)
+        data_buffer["q_curr"].append(q_t_noise)
         data_buffer["action_val"].append(action_value) # 存原始动作值
         data_buffer["action_idx"].append(current_action_idx)
-        data_buffer["forces_field"].append(nodes_force)
+        data_buffer["forces_field"].append(nodes_force_noise)
+
+    write_mshv2_triangular(f"{OUTPUT_DIR}/{TIMESTAMP}/pd_contact{soft.contact_particle_list[0]}_step{step+1:03d}.msh",
+                        q_t_noise, soft.ele.to_numpy())
 
     # --- [保存为 HDF5] ---
     h5_path = Path(DATA_DIR) / "demo" / "pd_stretch_data_hete" / TIMESTAMP / "0.hdf5"
@@ -145,14 +160,17 @@ if __name__ == "__main__":
         f.attrs['E'] = 1.e3
         f.attrs['nu'] = 0.3
         f.attrs['dt'] = 1.e-2
-        f.attrs['total_steps'] = len(data_buffer["q_prev"])
+        f.attrs['total_steps'] = len(data_buffer["q_curr"])
         f.attrs['description'] = "Simulation of soft tissue stretching"
+
+        f.attrs['noise_pos_sigma'] = NOISE_CFG["pos_sigma"]
+        f.attrs['noise_force_sigma'] = NOISE_CFG["force_sigma"]
         
         # 3. 保存轨迹数据 (Converting lists to numpy arrays)
         # 最终 shape 示例: q_prev -> (20, N, 2)
         g_data = f.create_group('trajectories')
         
-        g_data.create_dataset('q_prev', data=np.stack(data_buffer["q_prev"]), compression="gzip")
+        # g_data.create_dataset('q_prev', data=np.stack(data_buffer["q_prev"]), compression="gzip")
         g_data.create_dataset('q_curr', data=np.stack(data_buffer["q_curr"]), compression="gzip")
         g_data.create_dataset('action_val', data=np.stack(data_buffer["action_val"]), compression="gzip")
         g_data.create_dataset('action_idx', data=np.stack(data_buffer["action_idx"]), compression="gzip")

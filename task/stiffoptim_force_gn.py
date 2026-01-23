@@ -76,7 +76,7 @@ if __name__ == "__main__":
     lam = 1.e-6  # Hessian 正则化系数
 
     # load dataset #
-    demo_dir = DATA_DIR / "demo" / "pd_stretch_data_hete" / "20260106_123028"
+    demo_dir = DATA_DIR / "demo" / "pd_stretch_data_hete" / "20260122_094805"
     dataset = HDF5PdDataset(data_directory=str(demo_dir))
     print(f"数据集加载完成，共包含 {len(dataset)} 个样本。")
 
@@ -113,7 +113,7 @@ if __name__ == "__main__":
         #     continue  # 只使用每个轨迹的最后一个时间步数据
 
         contact_idx = int(sample['contact_idx'])
-        pre_node_pos = sample['pre_x'].to('cuda')
+        # pre_node_pos = sample['pre_x'].to('cuda')
         post_node_pos = sample['post_x'][:, :2].to('cuda')
         # action = sample['action'].to('cuda')
         node_force = sample['force'].to('cuda')
@@ -242,7 +242,7 @@ if __name__ == "__main__":
     plt.ylabel('y')
     plt.title(f'Stiffness per Element')
 
-    out_path_stiff = Path(VISUALIZATION_DIR) / f"stiffness.svg"
+    out_path_stiff = Path(VISUALIZATION_DIR) / f"stiffness_gn.svg"
     plt.savefig(out_path_stiff, dpi=200)
     plt.close()
     print(f"Saved stiffness visualization to {out_path_stiff}")
@@ -251,7 +251,7 @@ if __name__ == "__main__":
     soft_model.stretch_weight.from_numpy(updated_w)
     soft_model.precomputation()
 
-    soft_model.node_pos.from_numpy(pre_node_pos[:, 0:2].cpu().numpy())
+    soft_model.node_pos.from_numpy(post_node_pos[:, 0:2].cpu().numpy())
     soft_model.cal_deformation_gradient()
     soft_model.update_internal_force()
 
