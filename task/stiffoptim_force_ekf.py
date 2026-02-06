@@ -15,7 +15,7 @@ import meshio
 from pathlib import Path
 from typing import List, Optional, Dict
 
-from const import ROOT_DIR, MESH_DIR, OUTPUT_DIR, DATA_DIR, VISUALIZATION_DIR
+from const import ROOT_DIR, MESH_DIR, OUTPUT_DIR, DATA_DIR, VISUALIZATION_DIR, ARTICLE_VIS_DIR
 from deformation_model.diffpd_2d import Soft2D
 from deformation_model.pd_data_loader import HDF5PdDataset
 
@@ -24,6 +24,7 @@ from deformation_model.pd_data_loader import HDF5PdDataset
 class Soft2DForce(Soft2D):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        self.device = kwargs.pop('device', 'cuda')
         self.dforce_dw = ti.field(dtype=ti.f64, shape=(self.PARTICLE_N*2, self.ELEMENT_N))  # gradient of internal force wrt. stretch weight
         self.dforce_dq = ti.field(dtype=ti.f64, shape=(self.PARTICLE_N*2, self.PARTICLE_N*2))  # tangent stiffness matrix
 
@@ -58,7 +59,7 @@ class Soft2DForce(Soft2D):
 
     @ti.kernel
     def cal_internal_force_gradient_pos(self):
-        """ compute the tangent stiffness matrix: gradient of internal force wrt. node positions """
+        """ compute the tangent stiffness matrix: dforce / dq. gradient of internal force wrt. node positions """
         self.dforce_dq.fill(0.)
 
         # \partial force / \partial q = - \nabla W(q) 
@@ -77,7 +78,7 @@ class Soft2DForce(Soft2D):
 
 class StiffnessEKF:
     def __init__(self, 
-                 num_elements: int, 
+                 mesh_info:dict,
                  initial_stiffness: torch.tensor, 
                  observe_nodes: List[int],
                  device: str="cuda",
@@ -100,7 +101,8 @@ class StiffnessEKF:
             sigma_f (float): 力传感器观测噪声方差 (用于计算 R)
         """
         self.device = device
-        self.ELE_NUM = num_elements
+        self.ELE_NUM = mesh_info['ELEMENT_N']
+        self.NODE_NUM = mesh_info['PARTICLE_N']
         self.obs_nodes = torch.tensor(observe_nodes, device=device, dtype=torch.long)
         self.obs_dofs = torch.stack([
             torch.tensor(observe_nodes, device=device, dtype=torch.long) * 2,
@@ -143,7 +145,7 @@ class StiffnessEKF:
         # 2. 协方差预测: P_{k|k-1} = P_{k-1|k-1} + Q(k)
         # 构建自适应 Q 矩阵
         Q_k_diag = torch.full((self.ELE_NUM,), self.q_base_val, device=self.device)
-        np.eye(self.ELE_NUM) * self.q_base_val
+        # np.eye(self.ELE_NUM) * self.q_base_val
         
         if len(cut_element_indices) > 0:
             # 论文策略: "noise covariance in the local modified area is inflated"
@@ -177,12 +179,9 @@ class StiffnessEKF:
         # --- 2. 计算等效观测噪声协方差 R(k) (Eq 6) ---
         
         # R = J_f * Sigma_q * J_f^T + Sigma_f
-        # 实际工程中常简化 R 为常数矩阵，即 R \approx Sigma_f
-        
-        # 完整写法 (假设 J_f_obs 近似代表主要影响):
         Sigma_q_mat = self.sigma_q_val * torch.eye(self.OBS_NUM*2, device=self.device, dtype=torch.float64)
-        sigma_f_full = torch.zeros(NODE_NUM*2, device=self.device, dtype=torch.float64)
-        sigma_f_full[contact_idx] = self.sigma_f_val  # 仅在接触点有力传感器噪声
+        sigma_f_full = torch.zeros(self.NODE_NUM*2, device=self.device, dtype=torch.float64)
+        sigma_f_full[2*contact_idx:2*contact_idx+2] = self.sigma_f_val  # 仅在接触点有力传感器噪声
         self.Sigma_f_mat = torch.diag(sigma_f_full[self.obs_dofs])
 
         term1 = J_f_obs @ Sigma_q_mat @ J_f_obs.T
@@ -241,6 +240,7 @@ class StiffnessEKF:
                      contact_idx_list: List[int]):
         """
         批量 EKF 更新 (基于信息滤波逻辑)
+        变换到log空间
         
         Args:
             dforce_dw_list: 长度为 N 的列表，每个元素 shape (2*n, m)
@@ -255,9 +255,14 @@ class StiffnessEKF:
 
         accumulated_strain_metric = torch.zeros(m, device=self.device, dtype=torch.float64)
 
+        P_inv_pre = torch.inverse(self.P)
+        sign, logdet = torch.linalg.slogdet(P_inv_pre)
+        print(f"Prior Info Matrix logdet: {-logdet.cpu().item():.6e}, sign: {sign}")
+
         # 2. 遍历 Batch，累加每个观测点的贡献
         for i in range(len(dforce_dw_list)):
             # --- 提取当前样本数据 ---
+            # 切换到 log 空间, 注意乘以 k_hat
             A_i = dforce_dw_list[i][self.obs_dofs, :] * self.k_hat.repeat(len(self.obs_dofs), 1)  # (n_obs, m)
             J_f_i = dforce_dq_list[i][self.obs_dofs][:, self.obs_dofs] # (n_obs, n_obs)
             f_int_pred = internal_force_list[i].flatten()[self.obs_dofs]
@@ -271,20 +276,20 @@ class StiffnessEKF:
             Sigma_q_mat = self.sigma_q_val * torch.eye(self.OBS_NUM*2, device=self.device, dtype=torch.float64)
             
             # 构造力传感器噪声 (仅在接触点)
-            sigma_f_full = torch.zeros(NODE_NUM*2, device=self.device, dtype=torch.float64)
+            sigma_f_full = torch.zeros(self.NODE_NUM*2, device=self.device, dtype=torch.float64)
             sigma_f_full[contact_idx] = self.sigma_f_val  # 仅在接触点有力传感器噪声
             Sigma_f_mat = torch.diag(sigma_f_full[self.obs_dofs])
 
             R_k_i = J_f_i @ Sigma_q_mat @ J_f_i.T + Sigma_f_mat
 
-
             # --- 计算信息增量 ---
-            # R_inv = torch.inverse(R_k_i) # n_obs 较小时直接求逆
-            # 为了稳定性，使用 solve: A^T * R^-1 * A -> A^T * solve(R, A)
+            # solve: A^T * R^-1 * A -> A^T * solve(R, A), for numerical stability
             R_inv_Ai = torch.linalg.solve(R_k_i, A_i) # (n_obs, m)
             
             # 更新 Hessian 贡献: A^T * R^-1 * A
             delta_Y += A_i.T @ R_inv_Ai
+            # np.savetxt(OUTPUT_DIR / f"A_{i}.csv", A_i.cpu().numpy(), delimiter=",")
+            # np.savetxt(OUTPUT_DIR / f"delta_Y_contrib_{i}.csv", (A_i.T @ R_inv_Ai).cpu().numpy(), delimiter=",")
             
             # 更新 Gradient 贡献: A^T * R^-1 * (z - h)
             innovation = f_meas - f_int_pred
@@ -293,15 +298,9 @@ class StiffnessEKF:
 
         # 3. 融合先验信息与观测信息 (Information Fusion)
         # P_post = (P_pre^-1 + delta_Y)^-1
-        # 这种写法避免了多次 K 增益计算，统一进行一次大矩阵求逆
-        P_inv_pre = torch.inverse(self.P)
-
-        # 空间平滑增量
-        lambda_s = 0.e-8 # 调节平滑强度的超参数
-        delta_Y_reg = lambda_s * self.L
-        delta_b_reg = -lambda_s * (self.L @ self.k_hat)
-
-        P_inv_post = P_inv_pre + delta_Y + delta_Y_reg
+        P_inv_post = P_inv_pre + delta_Y
+        # sign, logdet = torch.linalg.slogdet(P_inv_post)
+        # print(f"Post Info Matrix logdet: {-logdet.cpu().item():.6e}, sign: {sign}")
 
         self.delta_Y = delta_Y
         
@@ -309,7 +308,6 @@ class StiffnessEKF:
         self.P = torch.inverse(P_inv_post)
         
         # 4. 状态更新: k_post = k_pre + P_post * delta_b
-        # self.k_hat = self.k_hat + self.P @ (delta_b + delta_b_reg)
         self.k_hat = self.k_hat * torch.exp(self.P @ delta_b)
 
         # 5. 物理约束与数值对称化
@@ -346,11 +344,11 @@ def construct_laplacian_matrix(neighbors: np.ndarray) -> np.ndarray:
 if __name__ == "__main__":
     ti.init(arch=ti.cuda, debug=True)
 
-    hard_area = [151, 174, 176, 177, 178, 179, 182, 186, 218, 219, 220, 306]
-    free_area = [201, 203, 223, 227, 240, 241] + [133, 190, 197, 199, 206, 222, 259]
+    hard_area = [151, 174, 176, 177, 178, 179, 182, 186, 218, 219, 220, 306] + [201, 203, 223, 227, 240, 241]
+    free_area = []
     
     # load dataset #
-    demo_dir = DATA_DIR / "demo" / "pd_stretch_data_hete" / "20260122_094705"
+    demo_dir = DATA_DIR / "demo" / "pd_stretch_data_hete" / "20260204_201544"
     dataset = HDF5PdDataset(data_directory=str(demo_dir))
     print(f"数据集加载完成，共包含 {len(dataset)} 个样本。")
 
@@ -370,6 +368,7 @@ if __name__ == "__main__":
     FACE_NUM = MESH_DATA['F'].shape[0]
     OBSERVE_NODES = list(set(range(NODE_NUM)) - set(FIXED_NODES))
     OBSERVE_DOFS = np.stack([np.array(OBSERVE_NODES) * 2, np.array(OBSERVE_NODES) * 2 + 1], axis=-1).flatten().tolist()
+    OBSERVE_DICT = {node_idx: i for i, node_idx in enumerate(OBSERVE_NODES)}
 
     # 使用 Dict[KeyType, ValueType]
     model_cache: Dict[int, Soft2DForce] = {}
@@ -379,12 +378,12 @@ if __name__ == "__main__":
     # init_k_guess[free_ele_list] *= 0.01
     
     ekf = StiffnessEKF(
-        num_elements=FACE_NUM,
+        mesh_info={"PARTICLE_N": NODE_NUM, "ELEMENT_N": FACE_NUM},
         initial_stiffness=init_k_guess,
         observe_nodes=OBSERVE_NODES,
         p_init_var=1.e20,
         q_process_noise=1.e3,
-        sigma_q=1.e-5,
+        sigma_q=1.e-4,
         sigma_f=1e-1,
     )
 
@@ -496,7 +495,7 @@ if __name__ == "__main__":
 
     #     soft_model.hessian_stretch()
     #     soft_model.cal_internal_force_gradient_pos()    # 计算 dforce_dq
-        
+
     #     # 4. EKF 更新
     #     dforce_dw_torch = soft_model.dforce_dw.to_torch(device="cuda").double()
     #     dforce_dq_torch = soft_model.dforce_dq.to_torch(device="cuda").double()
@@ -519,7 +518,9 @@ if __name__ == "__main__":
     np.savetxt(Path(OUTPUT_DIR) / "estimated_stiffness_ekf.csv", raw_k, delimiter=",")
     np.savetxt(Path(OUTPUT_DIR) / "P_matrix_ekf.csv", ekf.P.cpu().numpy(), delimiter=",")
     # np.savetxt(Path(OUTPUT_DIR) / "P_inv_matrix_ekf.csv", torch.linalg.inv(ekf.P).cpu().numpy(), delimiter=",")
-    np.savetxt(Path(OUTPUT_DIR) / "P_diag_ekf.csv", P_diag, delimiter=",")   
+    np.savetxt(Path(OUTPUT_DIR) / "P_diag_ekf.csv", P_diag, delimiter=",")
+
+    print(f"Mean Variance of Stiffness Estimate: {np.mean(P_diag)}")
 
     cells = [("triangle", soft_model.ele.to_numpy().astype(np.int32))]
 
@@ -617,3 +618,76 @@ if __name__ == "__main__":
     # plt.savefig(out_path_deltay, dpi=200)
     # plt.close()
     # print(f"Saved delta Y diagonal visualization to {out_path_deltay}")
+
+
+    # exit()
+    # ==========================================
+    # 论文结果美化代码
+    # ==========================================
+    from matplotlib.colors import ListedColormap
+    import seaborn as sns
+
+    plt.style.use('default') # 重置
+    params = {
+        'font.family': 'serif',        # 衬线体 (Times New Roman 等)
+        'font.serif': ['Times New Roman', 'DejaVu Serif', 'serif'], # 显式指定
+        'mathtext.fontset': 'stix',    # 数学公式字体更像 LaTeX
+        'axes.labelsize': 14,
+        'font.size': 14,
+        'legend.fontsize': 14,
+        'xtick.labelsize': 14,
+        'ytick.labelsize': 14,
+        'axes.spines.top': False,      # 去掉顶部边框 (更简洁)
+        'axes.spines.right': False,    # 去掉右侧边框
+    }
+    plt.rcParams.update(params)
+
+    # colors = ['#F0F0F2', '#B81502'] # D9534F 912C2C
+    # cmap_custom = ListedColormap(colors)
+    cmap_custom = sns.color_palette("RdYlBu_r", as_cmap=True)
+
+    levels = 20
+    cmap_base = plt.get_cmap("RdYlBu_r")
+    cmap_discrete = plt.get_cmap("RdYlBu_r", levels)
+
+    variance = sigma_k.copy()
+    v_min, v_max = variance.min(), variance.max()
+    tick_locs = np.arange(np.ceil(np.log10(v_min)), np.floor(np.log10(v_max))+2)
+    fig, ax1 = plt.subplots(1, 1, figsize=(6, 5), constrained_layout=True)
+    im1 = ax1.tripcolor(node_pos_np[:, 0], node_pos_np[:, 1], triangles, 
+                        facecolors=np.log10(variance), shading='flat', 
+                        edgecolors='#333333', linewidth=0.7, alpha=0.9, cmap=cmap_custom,    # 
+                        vmin=tick_locs[0], vmax=tick_locs[-1])
+    # ax1.set_title('(b) Graph Cut Segmentation (Output)', pad=15)
+    ax1.set_aspect('equal')
+    ax1.axis('off')
+
+    # 自定义 Colorbar 的刻度
+    cbar1 = plt.colorbar(im1, ax=ax1, pad=0.01, shrink=0.8, aspect=20, fraction=0.046)
+    cbar1.ax.tick_params(length=0)
+
+    cbar1.set_ticks(tick_locs)
+    cbar1.set_ticklabels([f"$10^{{ {int(loc):d} }}$" for loc in tick_locs])
+
+    plt.savefig(f"{ARTICLE_VIS_DIR}/stiffness_variance.svg", transparent=True, format='svg', dpi=300, bbox_inches='tight')
+
+    # 可视化刚度值
+    # stiffness_show = 
+    v_min, v_max = raw_k.min(), raw_k.max()
+    tick_locs = np.arange(np.ceil(np.log10(v_min)), np.floor(np.log10(v_max)))
+    fig, ax1 = plt.subplots(1, 1, figsize=(6, 5), constrained_layout=True)
+    im2 = ax1.tripcolor(node_pos_np[:, 0], node_pos_np[:, 1], triangles,
+                        facecolors=np.log10(raw_k), shading='flat', 
+                        edgecolors='#333333', linewidth=0.7, alpha=0.9, cmap=cmap_custom,    # 
+                        )
+    ax1.set_aspect('equal')
+    ax1.axis('off')
+
+    # 自定义 Colorbar 的刻度
+    cbar1 = plt.colorbar(im2, ax=ax1, pad=0.01, shrink=0.8, aspect=20, fraction=0.046)
+    cbar1.ax.tick_params(length=0)
+
+    cbar1.set_ticks(tick_locs[::10])
+    cbar1.set_ticklabels([f"$10^{{ {int(loc):d} }}$" for loc in tick_locs[::10]])
+
+    plt.savefig(f"{ARTICLE_VIS_DIR}/stiffness_value.svg", transparent=True, format='svg', dpi=300, bbox_inches='tight')

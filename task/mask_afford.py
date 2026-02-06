@@ -12,7 +12,7 @@ import shapely
 import taichi as ti
 ti.init(arch=ti.cpu, debug=True, default_fp=ti.f64)
 
-from const import OUTPUT_DIR, MESH_DIR
+from const import OUTPUT_DIR, MESH_DIR, VISUALIZATION_DIR, ARTICLE_VIS_DIR
 from utilize.gen_mesh import MaskTo2DMesh
 from deformation_model.diffpd_2d_candi_contact import Soft2DNocontact
 from utilize.mesh_io import read_mshv2_triangular, write_mshv2_triangular
@@ -178,7 +178,7 @@ class Soft2D(Soft2DNocontact):
 
 if __name__ == "__main__":
     # 创建一个mask
-    H, W = 512, 512
+    H, W = 240, 500
     center = (W // 2, H // 2)
     radius = 150
     
@@ -289,7 +289,73 @@ if __name__ == "__main__":
         
         plt.margins(x=0.05, y=0.2)
         plt.tight_layout()
-        plt.savefig("mask&mesh.svg", dpi=300)
+        plt.savefig(VISUALIZATION_DIR / "mask&mesh.svg", dpi=300)
 
     except ValueError as e:
         print(f"处理失败: {e}")
+
+
+    # exit()
+    # ==========================================
+    # 论文结果美化代码
+    # ==========================================
+    plt.style.use('default') # 重置
+    params = {
+        'font.family': 'serif',        # 衬线体 (Times New Roman 等)
+        'font.serif': ['Times New Roman', 'DejaVu Serif', 'serif'], # 显式指定
+        'mathtext.fontset': 'stix',    # 数学公式字体更像 LaTeX
+        'axes.labelsize': 14,
+        'font.size': 14,
+        'legend.fontsize': 14,
+        'xtick.labelsize': 14,
+        'ytick.labelsize': 14,
+        'axes.spines.top': False,      # 去掉顶部边框 (更简洁)
+        'axes.spines.right': False,    # 去掉右侧边框
+    }
+    plt.rcParams.update(params)
+
+    unique_fixed_nodes = np.unique(fixed_nodes_pos)     # 去重逻辑有点问题，不过不重要
+    boundary_nodes_pos = V[boundary_node_indices]
+    boundary_node_afford = list(contacts_afford.values())
+    scale = 1./ max(boundary_node_afford)
+    boundary_node_size = 20 * scale * np.array(boundary_node_afford)
+
+    plt.figure(figsize=(5, 3))
+    
+    # 子图1: 原始Mask
+    plt.subplot(1, 1, 1)
+    plt.imshow(mask, cmap='gray')
+    plt.axis('off')
+    # plt.title('Image Mask')
+    plt.savefig(ARTICLE_VIS_DIR / "mask&mesh_1.svg", dpi=300, transparent=True)
+    
+    # 子图2: 生成的网格
+    plt.figure(figsize=(5, 3))
+    plt.subplot(1, 1, 1)
+    plt.triplot(V[:, 0], V[:, 1], F, 'bo-', lw=0.5, markersize=1)
+    plt.plot(fixed_points[:, 0], fixed_points[:, 1], 
+                'r*', markersize=8, label='Fixed Points (Input)')
+    plt.plot([suture_start[0], suture_end[0]], 
+                [suture_start[1], suture_end[1]], 
+                color='orange', linewidth=2, label='Suture Line')
+    plt.plot(probe_points[:, 0], probe_points[:, 1], 
+                'g*', markersize=8, label='Probe Points')
+    plt.scatter(boundary_nodes_pos[:, 0], boundary_nodes_pos[:, 1], 
+                s=boundary_node_size, color='k', zorder=2, label='Candidate Contact Nodes')
+    plt.quiver(boundary_nodes_pos[:, 0], boundary_nodes_pos[:, 1], 
+                contacts_jacobian[:, 0], contacts_jacobian[:, 1], color='k', 
+                scale_units='xy',   # 关键参数：使箭头长度与数据单位一致
+                scale=0.1,          # 关键参数：调整此值以控制箭头显示长度 (例如，如果所有向量长度都在1左右，scale=1会使它们显得很大，可以调大到20, 50来缩小它们)
+                angles='xy', 
+                width=0.005,       # 箭头的线宽，相对于图形大小
+                headwidth=5,      # 箭头头部的宽度
+                headlength=8,     # 箭头头部的长度
+                zorder=3, label='Affordance Vectors')
+    # plt.title(f'2D Mesh & Affordance Map\n(V={V.shape[0]}, F={F.shape[0]})')
+    # plt.legend()
+    plt.gca().set_aspect('equal')
+    plt.gca().invert_yaxis()  # 匹配图像坐标系 (Y轴向下)
+    plt.axis('off')
+    plt.margins(x=0.1, y=0.2)
+    plt.tight_layout()
+    plt.savefig(ARTICLE_VIS_DIR / "mask&mesh_2.svg", dpi=300, transparent=True)

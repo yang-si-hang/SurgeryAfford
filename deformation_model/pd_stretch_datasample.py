@@ -57,10 +57,10 @@ if __name__ == "__main__":
 
     # fix 和 contact的索引使用paraview可视化选择
     mesh_file = f"{MESH_DIR}/pd_stretch_demo_mesh_init.msh"
-    fix_nodes = [0] + list(range(45, 60)) + [23]
-    contact_node = 36   # 22, 15, 8, 37, 30
-    hard_ele_list = [151, 174, 176, 177, 178, 179, 182, 186, 218, 219, 220, 306]
-    free_ele_list = [201, 203, 223, 227, 240, 241]
+    fix_nodes = [0] + list(range(45, 60)) + []   # + 23, 38, 11, 8
+    contact_node = 37   # 22, 15, 8, 37, 30, 36
+    hard_ele_list = [151, 174, 176, 177, 178, 179, 182, 186, 218, 219, 220, 306]# + [201, 203, 223, 227, 240, 241]
+    free_ele_list = []    # [201, 203, 223, 227, 240, 241]
 
     # 规则化配置，用于测试
     # mesh_file = [0.1, 0.1]
@@ -100,15 +100,15 @@ if __name__ == "__main__":
 
     print("Start Simulation & Data Collection...")
 
-    for step in range(10):
+    for step in range(20):
         print(f"Action step {step}"+"-"*10)
 
         q_tm1 = soft.node_pos.to_numpy()
-        action_value = np.array([1.0, .0]) * 0.002 / soft.dt
+        action_value = np.array([1.4, 0.0]) * 0.002 / soft.dt
         current_action_idx = soft.contact_particle_list[0]
 
         # 此处要注意action与contact之间的
-        soft.contact_vel.from_numpy(np.array([[1.0, .0]]) * 0.002 / soft.dt)
+        soft.contact_vel.from_numpy(np.array([[1.4, 0.0]]) * 0.002 / soft.dt)
         soft.substep(step_num=0)
 
         soft.contact_vel.fill(0.)

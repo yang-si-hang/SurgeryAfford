@@ -35,7 +35,7 @@ from utilize.mesh_util import extract_edge_from_face, mesh_obj_tri
 
 @ti.data_oriented
 class Soft2D:
-    """ 基于triangular mesh，以及fix & contact nodes' indices构建的PD变形模型 """
+    """ 基于triangular mesh, 以及fix & contact nodes' indices构建的PD变形模型 """
     def __init__(self, shape, fix:List[int], contact:int, 
                  E:float, nu:float, dt:float, density:float, **kwargs):
         self.shape = shape
@@ -104,6 +104,7 @@ class Soft2D:
         self.lhs_stretch = ti.field(dtype=ti.f64, shape=(self.PARTICLE_N, self.PARTICLE_N))
         self.lhs_positional = ti.field(dtype=ti.f64, shape=(self.PARTICLE_N, self.PARTICLE_N))
         self.lhs_damp = ti.field(dtype=ti.f64, shape=(self.PARTICLE_N, self.PARTICLE_N))
+        self.lhs_stretch_e = ti.Matrix.field(3, 3, dtype=ti.f64, shape=self.ELEMENT_N)  # per-element lhs for stretch
         self.rhs = ti.field(dtype=ti.f64, shape=self.PARTICLE_N*2)
         self.rhs_stretch = ti.field(dtype=ti.f64, shape=self.PARTICLE_N*2)
         self.pre_fact_lhs_solve = None
@@ -111,6 +112,7 @@ class Soft2D:
         self.mass_matrix:np.ndarray = None
         self.g_hessian:np.ndarray = None
         self.dBp_stretch = ti.field(dtype=ti.f64, shape=(self.PARTICLE_N*2, self.PARTICLE_N*2))
+        self.dBp_stretch_e = ti.Matrix.field(6, 6, dtype=ti.f64, shape=self.ELEMENT_N)  # per-element dBp/dq
         self.dA = None
         self.dforce_dw_mat = ti.Matrix.field(3, 2, dtype=ti.f64, shape=self.ELEMENT_N)  # gradient of internal force wrt. stretch weight
         self.dfa_dy = ti.field(ti.f64, shape=self.PARTICLE_N)          # fa: attachment force
@@ -182,11 +184,13 @@ class Soft2D:
     def construct_lhs_stretch(self):
         # https://medium.com/@victorlouisdg/jax-cloth-tutorial-part-1-e7a0e285864f
         self.lhs_stretch.fill(0.)
+        self.lhs_stretch_e.fill(0.)
         for f_i in range(self.ELEMENT_N):
             Xg_inv = self.Xg_inv[f_i]
             a, b, c, d = Xg_inv[0, 0], Xg_inv[0, 1], Xg_inv[1, 0], Xg_inv[1, 1]
 
             # F_A's dim=4*6，F_A @ q = F.T，flatten的时候左侧行优先，而F列优先
+            # F_A @ q_x = F_x.T, shape: (2, 1)
             self.F_A[f_i][0, 0] = -a - c
             self.F_A[f_i][0, 1] = a
             self.F_A[f_i][0, 2] = c
@@ -206,6 +210,7 @@ class Soft2D:
                 lhs_row_idx, lhs_col_idx = q_idx_vec[A_row_idx], q_idx_vec[A_col_idx]
                 self.lhs[lhs_row_idx, lhs_col_idx] += stretch_weight * ATA[A_row_idx, A_col_idx]
                 self.lhs_stretch[lhs_row_idx, lhs_col_idx] += stretch_weight * ATA[A_row_idx, A_col_idx]
+                self.lhs_stretch_e[f_i] = ATA * self.ele_volume[f_i]    # normalize by volume
 
     @ti.kernel
     def construct_lhs_positional(self):
@@ -394,8 +399,10 @@ class Soft2D:
         """计算diffpd中stretch constraint的二阶导数矩阵(Hessian)
         """
         self.dBp_stretch.fill(0.)
+        self.dBp_stretch_e.fill(0.)
         dim = self.dim
         for f_i in range(self.ELEMENT_N):
+            volume_weight = self.ele_volume[f_i] / self.stretch_weight[f_i]
             F_Ai = self.F_A[f_i]
             U, sig, V = self.ele_u[f_i], self.stretch_stress[f_i], self.ele_v[f_i]
 
@@ -424,6 +431,7 @@ class Soft2D:
                     row_idx = row_idx_vec[k]
                     col_idx = col_idx_vec[l]
                     self.dBp_stretch[row_idx, col_idx] += AT_dBp_dq_i[k, l]
+                    self.dBp_stretch_e[f_i][2*k + m, 2*l + n] = AT_dBp_dq_i[k, l] * volume_weight   # 按照常规，逐维度排列
 
     def construct_g_hessian(self):
         """ 构建diffpd中g函数的Hessian矩阵 """
@@ -433,7 +441,7 @@ class Soft2D:
         self.g_hessian = A
 
     def construct_E_hessian(self):
-        """ 论文中能量函数的Hessian矩阵，dA = dBp/dq """
+        """ 论文中能量函数的Hessian矩阵, dA = dBp/dq """
         # self.construct_dx_const()
         self.construct_mass_matrix()
         self.hessian_stretch()
@@ -441,7 +449,7 @@ class Soft2D:
         self.construct_g_hessian()
 
     def model_z(self, dloss:np.ndarray):
-        """ 计算diffpd中的z向量：（\partial^2 g）@ z = dloss/dq_(n+1)  """
+        """ 计算diffpd中的z向量: (\partial^2 g) @ z = dloss/dq_(n+1)  """
         A = self.g_hessian
         b = dloss
         
@@ -450,7 +458,7 @@ class Soft2D:
 
     @ti.kernel
     def attach_gradient_pos(self):
-        """ Movement Constraint中的df_int/dx（其他约束没有） """
+        """ Movement Constraint中的df_int/dx (其他约束没有) """
         self.dfa_dy.fill(0.)
         for q_i in ti.static(self.contact_particle_list):
             self.dfa_dy[q_i] += self.positional_weight
@@ -462,17 +470,18 @@ class Soft2D:
         for q_i in range(self.PARTICLE_N):
             self.dfd_dy[q_i] += self.damp / self.dt * self.node_mass[q_i]
                 
-    def contact_jacobian(self):
+    def contact_jacobian(self)->np.ndarray:
         """ 计算变形雅可比矩阵dq(n+1)/da(n)中contact相关的列 """
         A = self.g_hessian
         self.attach_gradient_pos()
         self.damp_gradient_pos()
         B = self.mass_matrix + np.diag(np.repeat(self.dfa_dy.to_numpy(), 2)) \
              + np.diag(np.repeat(self.dfd_dy.to_numpy(), 2))
-        contact_idx = self.contact_particle_list[0]
-        dq_dy_np = np.linalg.solve(A, B[:,2*contact_idx:2*contact_idx+2])
+        contact_list = self.contact_particle_list
+        contact_index_vector = np.hstack([np.array(contact_list)*2, np.array(contact_list)*2+1]).flatten()
+        dq_dy_np = np.linalg.solve(A, B[:,contact_index_vector])
         return dq_dy_np
-
+    
 
 @ti.data_oriented
 class Soft2DAfford(Soft2D):

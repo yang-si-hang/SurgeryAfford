@@ -21,7 +21,7 @@ import taichi as ti
 import matplotlib.pyplot as plt
 import matplotlib.tri as mtri
 
-from const import ROOT_DIR, MESH_DIR, OUTPUT_DIR, DATA_DIR, VISUALIZATION_DIR
+from const import ROOT_DIR, MESH_DIR, OUTPUT_DIR, DATA_DIR, VISUALIZATION_DIR, ARTICLE_VIS_DIR
 from deformation_model.diffpd_2d import Soft2D
 from utilize.mesh_io import read_mshv2_triangular, write_mshv2_triangular
 from utilize.mesh_util import extract_edge_from_face, mesh_obj_tri
@@ -76,7 +76,7 @@ if __name__ == "__main__":
     lam = 1.e-6  # Hessian 正则化系数
 
     # load dataset #
-    demo_dir = DATA_DIR / "demo" / "pd_stretch_data_hete" / "20260122_094805"
+    demo_dir = DATA_DIR / "demo" / "pd_stretch_data_hete" / "20260204_201544"
     dataset = HDF5PdDataset(data_directory=str(demo_dir))
     print(f"数据集加载完成，共包含 {len(dataset)} 个样本。")
 
@@ -269,3 +269,47 @@ if __name__ == "__main__":
     np.savetxt(f"uncertainty_abs.csv", uncertainty_abs, fmt="%.6f", delimiter=',')
     np.savetxt(f"uncertainty_rel.csv", uncertainty_rel, fmt="%.6f", delimiter=',')
     np.savetxt(f"uncertainty_rel_real.csv", uncertainty_rel_real, fmt="%.6f", delimiter=',')
+
+
+    # ==========================================
+    # 论文结果美化代码
+    # ==========================================
+    from matplotlib.colors import ListedColormap
+    import seaborn as sns
+
+    plt.style.use('default') # 重置
+    params = {
+        'font.family': 'serif',        # 衬线体 (Times New Roman 等)
+        'font.serif': ['Times New Roman', 'DejaVu Serif', 'serif'], # 显式指定
+        'mathtext.fontset': 'stix',    # 数学公式字体更像 LaTeX
+        'axes.labelsize': 14,
+        'font.size': 14,
+        'legend.fontsize': 14,
+        'xtick.labelsize': 14,
+        'ytick.labelsize': 14,
+        'axes.spines.top': False,      # 去掉顶部边框 (更简洁)
+        'axes.spines.right': False,    # 去掉右侧边框
+    }
+    plt.rcParams.update(params)
+
+    cmap_custom = sns.color_palette("RdYlBu_r", as_cmap=True)
+
+    # 可视化刚度值
+    raw_k = updated_w.copy()
+    v_min, v_max = raw_k.min(), raw_k.max()
+    tick_locs = np.arange(np.ceil((v_min)), np.floor((v_max)))
+    fig, ax1 = plt.subplots(1, 1, figsize=(6, 5), constrained_layout=True)
+    im2 = ax1.tripcolor(node_pos_np[:, 0], node_pos_np[:, 1], triangles,
+                        facecolors=raw_k, shading='flat', 
+                        edgecolors='#333333', linewidth=0.7, alpha=0.9, cmap=cmap_custom)
+    ax1.set_aspect('equal')
+    ax1.axis('off')
+
+    # 自定义 Colorbar 的刻度
+    cbar1 = plt.colorbar(im2, ax=ax1, pad=0.01, shrink=0.8, aspect=20, fraction=0.046)
+    cbar1.ax.tick_params(length=0)
+
+    # cbar1.set_ticks(tick_locs)
+    # cbar1.set_ticklabels([f"$10^{{ {int(loc):d} }}$" for loc in tick_locs])
+
+    plt.savefig(f"{ARTICLE_VIS_DIR}/stiffness_value_gn.svg", transparent=True, format='svg', dpi=300, bbox_inches='tight')
