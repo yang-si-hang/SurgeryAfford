@@ -22,4 +22,44 @@
 
 ![](stiffness&variance_low.svg)
 
-相关代码：high_stiffnes_filter.py； low_stffness_filter.py
+相关代码：high_stiffnes_filter.py； low_stffness_filter.
+
+
+---
+
+### Paper Figure
+
+使用数据的路径: "data/demo/pd_stretch_data_hete/20260213_hard_1"
+
+代码: "task/stiffoptim_force_gn.py"; "task/stiffoptim_force_ekf.py"
+
+**形状一**
+
+Gauss-Newton:
+![alt text](stiffness_value_gn_paper[1].svg)
+
+EKF:
+![alt text](stiffness_value_ekf_paper[1].svg)
+
+![alt text](stiffness_variance_ekf_paper[1].svg)
+
+**形状二**
+
+接触点: [23, 44]
+
+动作量: [-1, 1] * 0.004, [1.1, -0.9] * 0.004
+
+Gauss-Newton:
+![alt text](stiffness_value_gn_paper[3].svg)
+
+EKF:
+![alt text](stiffness_value_ekf_paper[3].svg)
+
+![alt text](stiffness_variance_ekf_paper[3].svg)
+
+Metric:
+
+使用AUC和Recall指标
+
+代码: `task/high_stiffnes_filter.py`, `task/high_stiffnes_filter_2threshold.py`, `task/high_stiffness_seperate_metric.py`
+

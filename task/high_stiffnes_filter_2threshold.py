@@ -4,7 +4,7 @@
 Date: 2026-01-23
 """
 import numpy as np
-import maxflow
+import maxflow  # pip install PyMaxflow
 from sklearn.mixture import GaussianMixture
 import matplotlib.pyplot as plt
 from pathlib import Path
@@ -19,31 +19,22 @@ hard_ele_list = [151, 174, 176, 177, 178, 179, 182, 186, 218, 219, 220, 306]
 #                  256, 297, 327, 330, 379, 390, 391, 393, 396, 397, 401, 403, 412] + \
 #                 [238, 278, 287, 288, 359, 365, 366, 367, 370, 374, 414]
 
-# 要把fixed相关的单元去除计算,并且直接分类为背景
-
 neighbors_path = MESH_DIR / "pd_stretch_demo_mesh_neighbors.csv"
 neighbors = np.loadtxt(neighbors_path, delimiter=",")
-
-fixed_ele_list = np.loadtxt(OUTPUT_DIR / "background_ele_list.csv", delimiter=",", dtype=int).tolist()
-# fixed_ele_list = []
 
 variance_path = OUTPUT_DIR / "P_diag_ekf.csv"
 variance_vec = np.loadtxt(variance_path, delimiter=",")
 variance = np.log10(np.sqrt(variance_vec))
-# variance = np.sqrt(variance_vec)
 
-# variance = np.loadtxt(f"{OUTPUT_DIR}/estimated_stiffness_ekf.csv", delimiter=",")
-# variance = np.log10(variance)
+variance = np.loadtxt(f"{OUTPUT_DIR}/estimated_stiffness_ekf.csv", delimiter=",")
+variance = np.log10(variance)
 
-# variance = np.loadtxt(f"stretch_weight_update.csv", delimiter=",")
+variance = np.loadtxt(f"{OUTPUT_DIR}/stretch_weight_update.csv", delimiter=",")
 
-mesh_path = MESH_DIR / "pd_stretch_tissue_mesh_init_2.msh"
-mesh_path = OUTPUT_DIR / "20260225_220420" / "pd_contact[39, 77]_step010.msh"
+mesh_path = MESH_DIR / "pd_stretch_demo_mesh_init.msh"
 
 V, F = read_mshv2_triangular(mesh_path)
 mesh_data = {"V": V, "F": F}
-
-assert variance.shape[0] == F.shape[0], "Variance vector length must match number of cells (triangles)."
 
 n_cells = len(F)
 edge_to_cells = {}
@@ -52,53 +43,42 @@ for i, cell in enumerate(F):
         edge_to_cells.setdefault(edge, []).append(i)
 
 # ==========================================
-# 2. GMM 概率建模 (Data Term) —— 排除 fixed_cells
+# 2. GMM 概率建模 (Data Term)
 # ==========================================
 print("Step 1: Running GMM...")
 
 # GMM 输入需要是 (n_samples, n_features)
 X = variance.reshape(-1, 1)
-X_mask = np.delete(X, fixed_ele_list, axis=0)     # 去除与 fixed 相关的单元
 
-# 拟合两个高斯分布：背景 vs 高不确定性区域
-gmm = GaussianMixture(n_components=3, random_state=42)
+# 改为拟合两个高斯分布：低不确定性区域 vs 高不确定性区域
+gmm = GaussianMixture(n_components=2, random_state=42)
 gmm.fit(X)
 
 # 获取两个分布的均值，判断哪个是“高不确定性”类
 means = gmm.means_.flatten()
-high_uncertainty_idx = np.argmax(means) # 均值大的那个是目标索引
-low_uncertainty_idx = np.argmin(means)
-background_idx = 3 - high_uncertainty_idx - low_uncertainty_idx # 剩下的一个索引
+high_uncertainty_idx = np.argmax(means)  # 均值大的作为高不确定性区域 (Source)
+low_uncertainty_idx = np.argmin(means)   # 均值小的作为低不确定性区域 (Sink)
 
 print(f"  - Low Uncert Mean: {means[low_uncertainty_idx]:.4f}")
-print(f"  - Background Mean: {means[background_idx]:.4f}")
 print(f"  - High Uncert Mean: {means[high_uncertainty_idx]:.4f}")
 
 # 计算属于每一类的后验概率
 probs = gmm.predict_proba(X)
-prob_high = probs[:, high_uncertainty_idx] # 属于高不确定性的概率
-prob_bg = probs[:, background_idx]         # 属于背景的概率
-prob_low = probs[:, low_uncertainty_idx]  # 属于低不确定性的概率
+prob_high = probs[:, high_uncertainty_idx]  # 属于高不确定性的概率
+prob_low = probs[:, low_uncertainty_idx]    # 属于低不确定性的概率
 
-prob_sink = 1.0 - prob_high
+# 将低不确定性区域作为 Graph Cut 的背景 (Sink)
+prob_sink = prob_low
 
 # 防止 log(0) 错误，加一个极小值
 epsilon = 1e-10
 prob_high = np.clip(prob_high, epsilon, 1.0 - epsilon)
-prob_bg = np.clip(prob_sink, epsilon, 1.0 - epsilon)
+prob_sink = np.clip(prob_sink, epsilon, 1.0 - epsilon)
 
 # 计算 t-link (Terminal Link) 的能量项 (负对数似然)
-# Graph Cut 最小化能量，所以概率越高，能量(代价)应该越低
-# Source (S) = High Uncertainty, Sink (T) = Background
-# 如果割断 S->i 的边，意味着 i 变成了 Background (T)。代价应该是 "i 属于 High 的概率" 对应的某种惩罚？
-# 修正逻辑：
-# Capacity(S->i): 保持连接S的意愿。如果 P(High) 很大，我们希望保留 S->i，切断 i->T。
-# 所以 Cap(S->i) 应该大，Cap(i->T) 应该小。
-# 公式：Cap = -ln(1 - P) 或者直接用 -ln(P_other)
-# Cap(S->i) = -ln(P(Background))  <-- 如果 P(BG) 很小，代价巨大，很难切断
-# Cap(i->T) = -ln(P(High))        <-- 如果 P(High) 很大，代价很小，容易切断（归为S）
+# Source (S) = High Uncertainty, Sink (T) = Low Uncertainty
 data_term_weight_to_source = -np.log(prob_sink)  
-data_term_weight_to_sink = -np.log(prob_high) 
+data_term_weight_to_sink = -np.log(prob_high)
 
 # ==========================================
 # 3. Graph Cut 构建与求解 (Smoothness Term)
@@ -124,7 +104,6 @@ for edge, cells in edge_to_cells.items():
 # 计算 beta = 1 / (2 * sigma^2) = 1 / <(diff)^2>
 if num_edges > 0:
     beta = 1.0 / (diff_sq_sum / num_edges + 1e-10)
-    # beta = 1. / (2 * SIGMA**2) # 直接使用预设的 SIGMA 来计算 beta
 else:
     beta = 0 # Should not happen
 
@@ -155,13 +134,10 @@ for edge, cells in edge_to_cells.items():
         g.add_edge(nodes[u], nodes[v], weight, weight)
 
 # 添加 t-links (Terminal Links) —— 数据项
+# 批量添加以提高效率
 for i in range(n_cells):
-    # 设置节点分类到 Source (High Uncertainty) 和 Sink (Background) 的权重
-    if i in fixed_ele_list:
-        # 直接将与 fixed 相关的单元分类为背景 (Sink)
-        g.add_tedge(nodes[i], 0, 1e10) # Source 权重为0，Sink 权重非常大，强制分类为背景
-    else:
-        g.add_tedge(nodes[i], data_term_weight_to_source[i], data_term_weight_to_sink[i])
+    # add_tedge(node, capacity_from_source, capacity_to_sink)
+    g.add_tedge(nodes[i], data_term_weight_to_source[i], data_term_weight_to_sink[i])
 
 print("Step 3: Calculating Max Flow / Min Cut...")
 flow = g.maxflow()
@@ -236,7 +212,7 @@ params = {
 }
 plt.rcParams.update(params)
 
-colors = ['#F0F0F2', '#B81502'] # E3F2FD 1F77B4 B81502
+colors = ['#F0F0F2', '#B81502'] # D9534F 912C2C
 cmap_custom = ListedColormap(colors)
 
 fig, ax1 = plt.subplots(1, 1, figsize=(6, 5), constrained_layout=True)

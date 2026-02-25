@@ -1,11 +1,10 @@
 """
-基于协方差矩阵加权的应变最大化主动探索规划器
+基于协方差矩阵加权的应变最大化主动探索规划器, 用划分好的刚度区域 (或者边界) 进行加权
 loss = -|| S(t+1) ∑(t) ||_F = -sqrt( sum_k [ P_row_sum_k * (sigma0_k^2 + sigma1_k^2) ] )
 优先选用"SLSQP"方法进行优化, 速度更快
-Date: 2026-01-26
+Date: 2026-02-06
 """
 import time
-import pickle
 import taichi as ti
 import meshio
 import torch
@@ -17,7 +16,6 @@ from scipy.optimize import minimize, NonlinearConstraint, Bounds
 
 from stiffoptim_force_ekf import Soft2DForce, StiffnessEKF
 from deformation_model.pd_data_loader import HDF5PdDataset
-from deformation_model.pd_stretch_datasample import simulate_deformation
 from utilize.mesh_io import write_mshv2_triangular
 from const import DATA_DIR, OUTPUT_DIR, VISUALIZATION_DIR
 
@@ -430,17 +428,19 @@ class ActiveStiffnessPlanner:
         plt.close()
 
     def optimize_action(self, 
+                        contact_node_idx: int, 
                         current_q_vision: torch.Tensor,
                         current_stiffness_est: torch.Tensor,
+                        weighted_cells: List[int],
                         max_action_mag: float = 0.03,
-                        iter_num: int = 100,
-                        method: str = 'SLSQP'):
+                        optimize_options: Dict = None,):
         """
         基于当前视觉观测和刚度估计，优化下一步的施力动作
         Args:
+            contact_node_idx: 施力点索引
             current_q_vision (torch.Tensor): 视觉测量的当前位置
             current_stiffness_est (torch.Tensor): 当前刚度估计
-            measured_f_ext (torch.Tensor): 力传感器测量的当前外力, 用于初始化动作
+            weighted_cells: 参与加权的单元索引列表
             max_force_mag: 动作幅值的截断上限
             iter_num: 优化迭代次数
             method: 优化方法选择 ('SLSQP' or 'IPOPT')        
@@ -461,6 +461,9 @@ class ActiveStiffnessPlanner:
         
         P_prior = self.estimator.P
         P_row_sum = torch.sum(P_prior**2, dim=1)
+        weight = torch.ones((self.soft_model.ELEMENT_N,), device=self.device, dtype=torch.float64)
+        weight[weighted_cells] = 5.0  # 加大这些单元的权重
+        P_row_sum = P_row_sum * weight
         # np.savetxt(OUTPUT_DIR / "Y_prior.csv", Y_prior.cpu().numpy(), delimiter=",")
         # np.savetxt(OUTPUT_DIR / "P_prior.csv", P_prior.cpu().numpy(), delimiter=",")
       
@@ -469,7 +472,9 @@ class ActiveStiffnessPlanner:
 
         sig_sum = torch.ones((self.soft_model.ELEMENT_N, ), device=self.device, dtype=torch.float64) * 2.0  # 初始应变值 (无动作时)
         loss_current = torch.sqrt(torch.dot(P_row_sum, sig_sum)).item()
-        # print(f"Current loss (|S_(t+1) Σ_t|): {loss_current:.4f}")
+        print(f"Current loss (|S_(t+1) Σ_t|): {loss_current:.4f}")
+
+        print(f"--- Optimizing Action for Node {contact_node_idx} ---")
 
         # ======================================================================
         # Maximize the uncertainty-weighted strain energy norm (encourage stretching)
@@ -521,21 +526,13 @@ class ActiveStiffnessPlanner:
             # if val > 1.00: print(f"  [Action Violation] |u|={np.linalg.norm(u):.4f}>{max_action_mag:.4f}")
             return val   
             
-        if method == 'trust-constr':
-            cons_act = NonlinearConstraint(
-                fun=compute_act_cons,
-                lb=-np.inf,
-                ub=1.0,
-                jac=lambda u: 2*u / (max_action_mag**2 + 1e-12), # 解析雅可比
-                keep_feasible=True # 关键参数: 试图让中间迭代始终在圆内
-            )
-        else:
-            cons_act = NonlinearConstraint(
-                fun=compute_act_cons,
-                lb=-np.inf,
-                ub=1.0,
-                jac=lambda u: 2*u / (max_action_mag**2 + 1e-12) # 解析雅可比
-            )
+        cons_act = NonlinearConstraint(
+            fun=compute_act_cons,
+            lb=-np.inf,
+            ub=1.0,
+            jac=lambda u: 2*u / (max_action_mag**2 + 1e-12), # 解析雅可比
+            keep_feasible=True # 关键参数: 试图让中间迭代始终在圆内
+        )
 
         # 组装约束列表
         constraints = [cons_act]
@@ -544,11 +541,17 @@ class ActiveStiffnessPlanner:
         # u0_np = np.ones(len(self.soft_model.contact_particle_list) * 2) * 0.03
         u0_np = np.array([0.0, 0.0])  # 初始动作猜测
 
+        if optimize_options.get("method") is not None:
+            method = optimize_options["method"]
+        else:
+            raise ValueError("Optimization method must be specified in optimize_options['method']")
+        iter_num = optimize_options.get("iter_num", 100)
+
         if method == 'SLSQP':   # method='SLSQP': 序列最小二乘规划，适合处理含约束的平滑非线性优化
             options = {
                 'ftol': 1e-4, 
                 'maxiter': iter_num, 
-                'disp': False}
+                'disp': True}
         elif method == 'trust-constr':
             options = {
                 'gtol': 1e-4,
@@ -568,7 +571,7 @@ class ActiveStiffnessPlanner:
             options=options,
         )
         
-        # print(f"Optimization completed in {time.time() - start_time:.4f} seconds.")
+        print(f"Optimization completed in {time.time() - start_time:.4f} seconds.")
 
         if not res.success:
             print(f"Optimization Warning: {res.message}")
@@ -588,7 +591,7 @@ class ActiveStiffnessPlanner:
 if __name__ == "__main__":
     ti.init(arch=ti.cuda, debug=True)
 
-    demo_dir = DATA_DIR / "demo" / "pd_stretch_data_hete" / "20260221_215905"
+    demo_dir = DATA_DIR / "demo" / "pd_stretch_data_hete" / "20260206_101721"
     dataset = HDF5PdDataset(data_directory=str(demo_dir))
     print(f"数据集加载完成，共包含 {len(dataset)} 个样本。")
 
@@ -598,7 +601,7 @@ if __name__ == "__main__":
     MESH_DATA:dict = dataset.mesh_data
     FIXED_NODES = dataset.static_data['fix_nodes'].tolist()
     REAL_W = dataset.static_data['stiffness_truth']
-    HARD_ELE_LIST = dataset.static_data['hard_ele_idx'].tolist()
+    hard_ele_list = dataset.static_data['hard_ele_idx'].tolist()
     free_ele_list = dataset.static_data['free_ele_idx'].tolist()
 
     NODE_NUM = MESH_DATA['V'].shape[0]
@@ -629,21 +632,20 @@ if __name__ == "__main__":
     contact_idx_list = []
     for i in range(len(dataset)):
         sample = dataset[i]
-        contact_idx = sample['contact_idx']
+        contact_idx = int(sample['contact_idx'])
         measure_node_force = sample['force'].to("cuda")[OBSERVE_NODES,:]
         measure_q = sample['post_x'][:, :2].to("cuda")
 
-        contact_key = tuple(contact_idx)
-        if contact_key not in model_cache:
+        if contact_idx not in model_cache:
             # construct soft body model #
             new_model = Soft2DForce(
                 shape=MESH_DATA, fix=FIXED_NODES, 
                 contact=contact_idx, E=1.e1, nu=0.3, dt=1.e-2, density=1.e1, device="cuda",
             )
-            model_cache[contact_key] = new_model
+            model_cache[contact_idx] = new_model
             print(f"-> Construct new model for contact idx: {contact_idx}")
 
-        soft_model = model_cache[contact_key]
+        soft_model = model_cache[contact_idx]
 
         cut_indices = []
 
@@ -679,124 +681,32 @@ if __name__ == "__main__":
         contact_idx_list
     )
 
-    P_prior = ekf.P
-    P_row_sum = torch.sum(P_prior**2, dim=1)
-
-    sig_sum = torch.ones((FACE_NUM, ), device="cuda", dtype=torch.float64) * 2.0  # 初始应变值 (无动作时)
-    loss_current = torch.sqrt(torch.dot(P_row_sum, sig_sum)).item()
-    print(f"Initial Loss (|S_(t+1) Σ_t|): {loss_current:.4f}")
-
-    entropy_prior = ekf.get_entropy()
-    print(f"=> Posterior Entropy: {entropy_prior:.4f}")
     np.savetxt(OUTPUT_DIR / "P_matrix_ekf.csv", ekf.P.cpu().numpy(), delimiter=",")
+    
+    edge_celles = [44, 58, 74, 85, 87, 90, 91, 130, 138, 142, 319]
 
-    # candidate_contact = list(range(1, 45))
-    candidate_contact = list(set(range(1, 50)) - set(FIXED_NODES))
-    evaluation_results = {}
+    soft_init_model = Soft2DForceExtended(
+                shape=MESH_DATA, fix=FIXED_NODES, 
+                contact=22, E=1.e1, nu=0.3, dt=1.e-2, density=1.e1, device="cuda",
+            )
 
-    ekf_base = ekf
-    start_time = time.time()
-    for contact_idx in candidate_contact:
-        print(f"\n{'='*5} Evaluating Candidate Contact {contact_idx} {'='*5}")
-        ekf_candidate = ekf_base.clone()
+    planner = ActiveStiffnessPlanner(soft_init_model, ekf)
 
-        soft_init_model = Soft2DForceExtended(
-                    shape=MESH_DATA, fix=FIXED_NODES, 
-                    contact=contact_idx, E=1.e1, nu=0.3, dt=1.e-2, density=1.e1, device="cuda", print_info=False
-                )
+    vision_q_tensor = soft_init_model.node_pos_init.to_torch(device="cuda").double()
 
-        planner = ActiveStiffnessPlanner(soft_init_model, ekf_candidate)
-
-        vision_q_tensor = soft_init_model.node_pos_init.to_torch(device="cuda").double()
-
-        time_start = time.time()
-        optimal_action, optimal_fun = planner.optimize_action(
-            current_q_vision=vision_q_tensor,
-            current_stiffness_est=torch.ones(FACE_NUM, device="cuda") * 400.0,
-            max_action_mag=0.06,
-            iter_num=100,
-            method='SLSQP',  # 'SLSQP' or 'trust-constr'
-        )
-        spend_time = time.time() - time_start
-        increment = optimal_fun - loss_current
-        print(f"Optimization Time: {spend_time:.4f} seconds")
-        print(f"Optimal Action: {optimal_action}; Magnitude: {np.linalg.norm(optimal_action):.4f}")
-        print(f"Optimal Objective Function Value: {optimal_fun:.4f}; (Improvement: {increment:.4f})")
-
-        # 将动作代入EKF验证
-        step_num = 10    # 分为几步完成
-        action_value = optimal_action / step_num
-
-        deform_data = simulate_deformation(
-            mesh_file=MESH_DATA,
-            contact_idx=contact_idx,
-            fix_nodes=FIXED_NODES,
-            hard_ele_list=HARD_ELE_LIST,
-            action_value=action_value,
-            action_step=step_num,
-            save_data=False
-        )
-
-        assert step_num == deform_data["post_x"].shape[0], "Simulated step number does not match expected."
-
-        dforce_dw_list = []
-        dforce_dq_list = []
-        internal_force_list = []
-        measured_f_ext_list = []
-        contact_idx_list = []
-        for step_i in range(step_num):
-            q_sim = deform_data["post_x"][step_i, :, :2]
-            f_sim = deform_data["internal_force"][step_i, :, :]
-
-            measure_node_force = torch.from_numpy(f_sim[OBSERVE_NODES, :]).to("cuda").double()
-            measure_q = torch.from_numpy(q_sim).to("cuda").double()
-
-            soft_init_model.reconstruct_stretch_weight(init_k_guess)
-            soft_init_model.precomputation()
-
-            # 运行物理步 (Forward & Backward)
-            soft_init_model.node_pos.from_torch(measure_q) # 使用观测位置
-
-            soft_init_model.cal_deformation_gradient()
-            soft_init_model.update_internal_force()
-            soft_init_model.cal_internal_force_gradient() # 计算 dforce_dw
-
-            soft_init_model.hessian_stretch()
-            soft_init_model.cal_internal_force_gradient_pos()    # 计算 dforce_dq
-
-            dforce_dw_torch = soft_init_model.dforce_dw.to_torch(device="cuda").double()
-            dforce_dq_torch = soft_init_model.dforce_dq.to_torch(device="cuda").double()
-            internal_force_torch = soft_init_model.force.to_torch(device="cuda").double()
-
-            dforce_dw_list.append(dforce_dw_torch)
-            dforce_dq_list.append(dforce_dq_torch)
-            internal_force_list.append(internal_force_torch)
-            measured_f_ext_list.append(measure_node_force.double())
-            contact_idx_list.append(contact_idx)
-
-            # write_mshv2_triangular(OUTPUT_DIR / f"simulated_mesh_step{step_i}.msh", measure_q.cpu().numpy(), soft_init_model.ele.to_numpy())
-
-        ekf_candidate.batch_update(
-            dforce_dw_list,
-            dforce_dq_list,
-            internal_force_list,
-            measured_f_ext_list,
-            contact_idx_list
-        )
-
-        entropy_now = ekf_candidate.get_entropy()
-        entropy_reduction = entropy_prior - entropy_now
-        print(f"=> Reduced Entropy: {entropy_reduction:.4f}; Posterior Entropy: {entropy_now:.4f}")
-
-        evaluation_results[contact_idx] = {
-            'optimal_action': optimal_action,
-            'fun_increment': increment,
-            'entropy_reduction': entropy_reduction,
-            'covariance': ekf_candidate.P.cpu().numpy()
-        }
-    print(f"\nTotal Evaluation Time for {len(candidate_contact)} contacts: {time.time() - start_time:.4f} seconds")
-
-    save_path = OUTPUT_DIR / "evaluation_results_2_4.pkl"
-    with open(save_path, 'wb') as f:
-        pickle.dump(evaluation_results, f)
-    print(f"Results successfully saved to {save_path}")
+    time_start = time.time()
+    optimal_action, optimal_fun = planner.optimize_action(
+        contact_node_idx=22,
+        current_q_vision=vision_q_tensor,
+        current_stiffness_est=torch.ones(FACE_NUM, device="cuda") * 400.0,
+        weighted_cells = edge_celles,
+        max_action_mag=0.03,
+        optimize_options = {
+            "method": 'SLSQP',  # 'SLSQP' or 'trust-constr'
+            "iter_num": 100,
+        },
+    )
+    spend_time = time.time() - time_start
+    print(f"Optimization Time: {spend_time:.4f} seconds")
+    print(f"Optimal Action: {optimal_action}; Magnitude: {np.linalg.norm(optimal_action):.4f}")
+    print(f"Optimal Objective Function Value: {optimal_fun:.6f}")

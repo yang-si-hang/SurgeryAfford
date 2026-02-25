@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import List, Dict
 import numpy as np
 from scipy import sparse
+from scipy.optimize import minimize
 import torch
 import taichi as ti
 import matplotlib.pyplot as plt
@@ -57,12 +58,12 @@ class Soft2DForce(Soft2D):
         for f_i in range(self.ELEMENT_N):
             idx1, idx2, idx3 = self.ele[f_i]
 
-            self.dforce_dw[2*idx1, f_i]   += self.dforce_dw_mat[f_i][0, 0]
-            self.dforce_dw[2*idx1+1, f_i] += self.dforce_dw_mat[f_i][0, 1]
-            self.dforce_dw[2*idx2, f_i]   += self.dforce_dw_mat[f_i][1, 0]
-            self.dforce_dw[2*idx2+1, f_i] += self.dforce_dw_mat[f_i][1, 1]
-            self.dforce_dw[2*idx3, f_i]   += self.dforce_dw_mat[f_i][2, 0]
-            self.dforce_dw[2*idx3+1, f_i] += self.dforce_dw_mat[f_i][2, 1]
+            self.dforce_dw[2*idx1, f_i]   += self.dforce_dw_mat[f_i][0, 0] * self.ele_volume[f_i]
+            self.dforce_dw[2*idx1+1, f_i] += self.dforce_dw_mat[f_i][0, 1] * self.ele_volume[f_i]
+            self.dforce_dw[2*idx2, f_i]   += self.dforce_dw_mat[f_i][1, 0] * self.ele_volume[f_i]
+            self.dforce_dw[2*idx2+1, f_i] += self.dforce_dw_mat[f_i][1, 1] * self.ele_volume[f_i]
+            self.dforce_dw[2*idx3, f_i]   += self.dforce_dw_mat[f_i][2, 0] * self.ele_volume[f_i]
+            self.dforce_dw[2*idx3+1, f_i] += self.dforce_dw_mat[f_i][2, 1] * self.ele_volume[f_i]
 
     @ti.kernel
     def reconstruct_stretch_weight(self, stretch_weight:ti.types.ndarray()):
@@ -76,7 +77,7 @@ if __name__ == "__main__":
     lam = 1.e-6  # Hessian 正则化系数
 
     # load dataset #
-    demo_dir = DATA_DIR / "demo" / "pd_stretch_data_hete" / "20260204_201544"
+    demo_dir = DATA_DIR / "demo" / "pd_stretch_data_hete" / "20260215_hard[2]"
     dataset = HDF5PdDataset(data_directory=str(demo_dir))
     print(f"数据集加载完成，共包含 {len(dataset)} 个样本。")
 
@@ -91,8 +92,8 @@ if __name__ == "__main__":
 
     NODE_NUM = MESH_DATA['V'].shape[0]
     FACE_NUM = MESH_DATA['F'].shape[0]
-    OBSERVE_NODES = list(set(range(NODE_NUM)) - set(FIXED_NODES))
-    OBSERVE_DOFS = np.stack([np.array(OBSERVE_NODES) * 2, np.array(OBSERVE_NODES) * 2 + 1], axis=-1).flatten().tolist()
+    OBSERVE_NODES_INIT = list(set(range(NODE_NUM)) - set(FIXED_NODES))
+    # OBSERVE_DOFS = np.stack([np.array(OBSERVE_NODES) * 2, np.array(OBSERVE_NODES) * 2 + 1], axis=-1).flatten().tolist()
 
     total_partial_g = np.zeros((FACE_NUM,))
     total_hessian_g = np.zeros((FACE_NUM, FACE_NUM))
@@ -117,6 +118,9 @@ if __name__ == "__main__":
         post_node_pos = sample['post_x'][:, :2].to('cuda')
         # action = sample['action'].to('cuda')
         node_force = sample['force'].to('cuda')
+
+        OBSERVE_NODES = list(set(OBSERVE_NODES_INIT))
+        OBSERVE_DOFS = np.stack([np.array(OBSERVE_NODES) * 2, np.array(OBSERVE_NODES) * 2 + 1], axis=-1).flatten().tolist()
 
         if contact_idx not in model_cache:
             # construct soft body model #
@@ -149,7 +153,7 @@ if __name__ == "__main__":
         residual_flat = force_residual.flatten()
 
         current_loss = np.sum(force_residual**2)
-        print(f"Sample {i} (Contact {contact_idx}): Loss = {current_loss:.4e}")
+        # print(f"Sample {i} (Contact {contact_idx}): Loss = {current_loss:.4e}")
         
         current_partial_g = 2 * residual_flat @ dforce_dw_observe  # shape: [E,]
         current_hessian_g = 2 * dforce_dw_observe.T @ dforce_dw_observe  # shape: [E, E]
@@ -167,9 +171,37 @@ if __name__ == "__main__":
     # H_new = H + lambda * I
     hessian_reg = avg_hessian_g + np.eye(FACE_NUM) * lam
 
-    # Solve: (H + lam*I) * delta_w = -g
-    delta_w = - np.linalg.solve(avg_hessian_g, avg_partial_g)
-    updated_w = soft_model.stretch_weight.to_numpy() + delta_w
+    # scipy, 带约束求解
+    H = avg_hessian_g + np.eye(FACE_NUM) * lam
+    g0 = avg_partial_g
+    w_init_val = init_w.cpu().numpy() # 你的初始猜测值
+    def objective(delta_w):
+        # 0.5 * dw' * H * dw + g0' * dw
+        return 0.5 * delta_w.dot(H @ delta_w) + g0.dot(delta_w)
+
+    def jacobian(delta_w):
+        # H * dw + g0
+        return H @ delta_w + g0
+
+    bounds = [(1e-6 - w_val, None) for w_val in w_init_val]
+
+    delta_w_0 = np.zeros_like(w_init_val)
+    print("-> 开始 Scipy 优化...")
+    res = minimize(objective, delta_w_0, method='L-BFGS-B', jac=jacobian, 
+                   bounds=bounds, )
+
+    if res.success:
+        final_delta_w = res.x
+        final_w = w_init_val + final_delta_w
+        print("优化成功！")
+    else:
+        print("优化失败")
+
+    updated_w = init_w.cpu().numpy() + res.x
+
+    # # Solve: (H + lam*I) * delta_w = -g
+    # delta_w = - np.linalg.solve(avg_hessian_g, avg_partial_g)
+    # updated_w = init_w.cpu().numpy() + delta_w
 
     # print hard and free element stiffness #
     print("\n刚度值更新完毕，部分单元刚度值如下：")
@@ -182,11 +214,11 @@ if __name__ == "__main__":
     problematic_indices = np.where(np.diag(resolution_mat)<0.6)[0]
     rel_error = np.abs(REAL_W - updated_w) / REAL_W
 
-    np.savetxt(f"stretch_weight_update.csv", updated_w, fmt="%.6f", delimiter=',')
-    np.savetxt(f"dforce_dw.csv", dforce_dw, fmt="%.6f", delimiter=',')
-    np.savetxt(f"hessian_g.csv", total_hessian_g, fmt="%.6f", delimiter=',')
-    np.savetxt(f"hessian_g_inv.csv", np.linalg.inv(total_hessian_g), fmt="%.6f", delimiter=',')
-    np.savetxt(f"resolution_mat.csv", np.diag(resolution_mat), fmt="%.6f", delimiter=',')
+    np.savetxt(f"{OUTPUT_DIR}/stretch_weight_update.csv", updated_w, fmt="%.6f", delimiter=',')
+    # np.savetxt(f"dforce_dw.csv", dforce_dw, fmt="%.6f", delimiter=',')
+    # np.savetxt(f"hessian_g.csv", total_hessian_g, fmt="%.6f", delimiter=',')
+    # np.savetxt(f"hessian_g_inv.csv", np.linalg.inv(total_hessian_g), fmt="%.6f", delimiter=',')
+    np.savetxt(f"{OUTPUT_DIR}/resolution_mat.csv", np.diag(resolution_mat), fmt="%.6f", delimiter=',')
     print(f"Loss: {total_loss:.6e}")
     print(f"Upated stretch weights (first 10): {updated_w[:10]}")
     print(f"Updated weight mean: {update_w_mean:.6f}")
@@ -197,7 +229,7 @@ if __name__ == "__main__":
     pos_np = post_node_pos.detach().cpu().numpy()
     force_np = - internal_force  # shape: [N, 2]
     print(f"Force sum: {np.sum(force_np, axis=0)}")
-    np.savetxt("internal_force.csv", force_np, fmt="%.6f", delimiter=',')
+    np.savetxt(f"{OUTPUT_DIR}/internal_force.csv", force_np, fmt="%.6f", delimiter=',')
 
     plt.figure(figsize=(6, 6))
     plt.quiver(
@@ -271,6 +303,7 @@ if __name__ == "__main__":
     np.savetxt(f"uncertainty_rel_real.csv", uncertainty_rel_real, fmt="%.6f", delimiter=',')
 
 
+    # exit()
     # ==========================================
     # 论文结果美化代码
     # ==========================================
@@ -301,13 +334,13 @@ if __name__ == "__main__":
     fig, ax1 = plt.subplots(1, 1, figsize=(6, 5), constrained_layout=True)
     im2 = ax1.tripcolor(node_pos_np[:, 0], node_pos_np[:, 1], triangles,
                         facecolors=raw_k, shading='flat', 
-                        edgecolors='#333333', linewidth=0.7, alpha=0.9, cmap=cmap_custom)
+                        edgecolors='#333333', linewidth=1., alpha=0.9, cmap=cmap_custom)
     ax1.set_aspect('equal')
     ax1.axis('off')
 
     # 自定义 Colorbar 的刻度
     cbar1 = plt.colorbar(im2, ax=ax1, pad=0.01, shrink=0.8, aspect=20, fraction=0.046)
-    cbar1.ax.tick_params(length=0)
+    cbar1.ax.tick_params(length=0, labelsize=14)
 
     # cbar1.set_ticks(tick_locs)
     # cbar1.set_ticklabels([f"$10^{{ {int(loc):d} }}$" for loc in tick_locs])

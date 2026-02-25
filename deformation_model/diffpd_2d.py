@@ -38,7 +38,13 @@ class Soft2D:
     """ 基于triangular mesh, 以及fix & contact nodes' indices构建的PD变形模型 """
     def __init__(self, shape, fix:List[int], contact:int, 
                  E:float, nu:float, dt:float, density:float, **kwargs):
+        """
+        Args:
+            damp (float): 阻尼系数
+            print_info (bool): 是否打印模型信息（如节点数、元素数、质量总和等），默认为True
+        """
         self.shape = shape
+        self.print_info = kwargs.get('print_info', True)
 
         if isinstance(self.shape, Path) or isinstance(self.shape, str):
             node_np, ele_np = read_mshv2_triangular(self.shape)
@@ -119,9 +125,10 @@ class Soft2D:
         self.dfd_dy = ti.field(ti.f64, shape=self.PARTICLE_N)          # fd: damping force
 
         self.fix_particle_list = fix
-        self.contact_particle_list = [int(contact)]
+        # self.contact_particle_list = [int(contact)]
+        self.contact_particle_list = [int(contact)] if isinstance(contact, int) else contact
         self.FIX_N = len(self.fix_particle_list)
-        self.CON_N = 1  # 默认只有一个接触
+        self.CON_N = len(self.contact_particle_list)
         self.fix_particle_ti     = ti.field(dtype=ti.i32, shape=self.FIX_N)
         self.contact_particle_ti = ti.field(dtype=ti.i32, shape=self.CON_N)
         self.fix_particle_ti.from_numpy(np.array(self.fix_particle_list).astype(np.int32))
@@ -134,8 +141,9 @@ class Soft2D:
         self.positional_weight = 1.e5 * self.node_mass_sum[None] / self.PARTICLE_N / self.dt**2
         # self.construct_dx_const()
 
-        print(f"Particle numer: {self.PARTICLE_N}; Edge number: {self.EDGE_N}; Element number: {self.ELEMENT_N}")
-        print(f"Positional weight: {self.positional_weight:.3f}")
+        if self.print_info:
+            print(f"Particle numer: {self.PARTICLE_N}; Edge number: {self.EDGE_N}; Element number: {self.ELEMENT_N}")
+            print(f"Positional weight: {self.positional_weight:.3f}")
 
     @property
     def stiffness(self):
@@ -161,7 +169,8 @@ class Soft2D:
         for q_i in range(self.PARTICLE_N):
             self.node_mass[q_i] = self.density * self.node_voronoi[q_i]
             self.node_mass_sum[None] += self.node_mass[q_i]
-        print(f"Node mass sum: {self.node_mass_sum[None]:.3f}")
+        if self.print_info:
+            print(f"Node mass sum: {self.node_mass_sum[None]:.3f}")
 
     @ti.kernel
     def construct_Xg_inv(self):

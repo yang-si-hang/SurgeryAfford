@@ -110,7 +110,8 @@ class StiffnessEKF:
         ], dim=-1).flatten()
         self.OBS_NUM = len(observe_nodes)
 
-        # 1. State Vector: \hat{K} (Current Belief)
+        # State Vector: \hat{K} (Current Belief)
+        self.init_stiffness = initial_stiffness.to(device, dtype=torch.float64)
         self.k_hat = initial_stiffness.to(device, dtype=torch.float64)
 
         # 2. Covariance Matrix: P
@@ -126,6 +127,8 @@ class StiffnessEKF:
         # Sigma_f: 力传感器噪声 covariance matrix
         self.sigma_f_val = sigma_f
         self.Sigma_f_mat = torch.zeros(self.OBS_NUM*2, self.OBS_NUM*2, device=device, dtype=torch.float64)
+
+        self.entropy_0 = 0.5 * self.ELE_NUM * np.log(2 * np.pi * np.e)  # 常数项，便于计算相对熵
 
     def predict(self, cut_element_indices: List[int] = []):
         """
@@ -256,8 +259,8 @@ class StiffnessEKF:
         accumulated_strain_metric = torch.zeros(m, device=self.device, dtype=torch.float64)
 
         P_inv_pre = torch.inverse(self.P)
-        sign, logdet = torch.linalg.slogdet(P_inv_pre)
-        print(f"Prior Info Matrix logdet: {-logdet.cpu().item():.6e}, sign: {sign}")
+        # sign, logdet = torch.linalg.slogdet(P_inv_pre)
+        # print(f"Prior Info Matrix logdet: {-logdet.cpu().item():.6e}, sign: {sign}")
 
         # 2. 遍历 Batch，累加每个观测点的贡献
         for i in range(len(dforce_dw_list)):
@@ -317,10 +320,45 @@ class StiffnessEKF:
         avg_strain_factor = accumulated_strain_metric / len(dforce_dw_list)
         avg_internal_force_modulus = torch.abs(self.k_hat) * avg_strain_factor
 
-        self.stress_metric = avg_internal_force_modulus
+        self.stress_metric = avg_internal_force_modulus     # 每个单元的应力
 
     def get_stiffness(self):
         return self.k_hat
+
+    def get_entropy(self):
+        P_stable = self.P + 1e-8 * torch.eye(self.P.shape[0], device=self.device, dtype=torch.float64)
+        sign, logdet = torch.linalg.slogdet(P_stable)
+        entropy = 0.5 * logdet.cpu().item() + self.entropy_0  # 仅与 log(det(P)) 相关
+        return entropy
+
+    def clone(self):
+        """
+        深拷贝当前的 EKF 状态，用于在不同探索分支中独立推演
+        """
+        # 实例化一个新的 EKF 对象
+        new_ekf = StiffnessEKF(
+            mesh_info={'ELEMENT_N': self.ELE_NUM, 'PARTICLE_N': self.NODE_NUM},
+            initial_stiffness=self.init_stiffness, # 使用当前最新的状态估计
+            observe_nodes=self.obs_nodes.cpu().tolist(),
+            device=self.device,
+            p_init_var=1.0, # 占位，马上会被真实 P 覆盖
+            q_process_noise=self.q_base_val,
+            q_inflation_factor=self.q_inflation,
+            sigma_q=self.sigma_q_val,
+            sigma_f=self.sigma_f_val
+        )
+        
+        # 覆盖协方差矩阵和其他内部状态
+        new_ekf.P = self.P.clone().detach()
+        new_ekf.Sigma_f_mat = self.Sigma_f_mat.clone().detach()
+        
+        # 如果有动态生成的属性，也一并拷贝
+        if hasattr(self, 'delta_Y'):
+            new_ekf.delta_Y = self.delta_Y.clone().detach()
+        if hasattr(self, 'stress_metric'):
+            new_ekf.stress_metric = self.stress_metric.clone().detach()
+            
+        return new_ekf
 
 def construct_laplacian_matrix(neighbors: np.ndarray) -> np.ndarray:
     num_faces = neighbors.shape[0]
@@ -344,16 +382,16 @@ def construct_laplacian_matrix(neighbors: np.ndarray) -> np.ndarray:
 if __name__ == "__main__":
     ti.init(arch=ti.cuda, debug=True)
 
-    hard_area = [151, 174, 176, 177, 178, 179, 182, 186, 218, 219, 220, 306] + [201, 203, 223, 227, 240, 241]
-    free_area = []
+    # hard_area = [151, 174, 176, 177, 178, 179, 182, 186, 218, 219, 220, 306]
+    # free_area = []
     
     # load dataset #
-    demo_dir = DATA_DIR / "demo" / "pd_stretch_data_hete" / "20260204_201544"
+    demo_dir = DATA_DIR / "demo" / "pd_stretch_data_hete" / "20260221_215905_active-strain[2]"
     dataset = HDF5PdDataset(data_directory=str(demo_dir))
     print(f"数据集加载完成，共包含 {len(dataset)} 个样本。")
 
-    neighbor_info = np.loadtxt(f"{MESH_DIR}/pd_stretch_demo_mesh_neighbors.csv", delimiter=",", dtype=np.int32)
-    laplacian_mat = construct_laplacian_matrix(neighbor_info)
+    # neighbor_info = np.loadtxt(f"{MESH_DIR}/pd_stretch_demo_mesh_neighbors.csv", delimiter=",", dtype=np.int32)
+    # laplacian_mat = construct_laplacian_matrix(neighbor_info)
 
     if len(dataset) == 0:
         raise ValueError("Dataset is empty. Please check the data directory.")
@@ -368,10 +406,15 @@ if __name__ == "__main__":
     FACE_NUM = MESH_DATA['F'].shape[0]
     OBSERVE_NODES = list(set(range(NODE_NUM)) - set(FIXED_NODES))
     OBSERVE_DOFS = np.stack([np.array(OBSERVE_NODES) * 2, np.array(OBSERVE_NODES) * 2 + 1], axis=-1).flatten().tolist()
-    OBSERVE_DICT = {node_idx: i for i, node_idx in enumerate(OBSERVE_NODES)}
+    
+    # 将固定节点相关的单元分类为背景单元
+    fixed_mask = np.isin(MESH_DATA['F'], np.array(FIXED_NODES))
+    faces_with_fixed = np.any(fixed_mask, axis=1)
+    background_ele_list = np.where(faces_with_fixed)[0].tolist()
+    np.savetxt(OUTPUT_DIR / "background_ele_list.csv", np.array(background_ele_list), delimiter=",", fmt="%d")
 
     # 使用 Dict[KeyType, ValueType]
-    model_cache: Dict[int, Soft2DForce] = {}
+    model_cache: Dict[tuple, Soft2DForce] = {}
     
     init_k_guess = torch.ones(FACE_NUM, device="cuda") * 400.0 # 初始猜测
     # init_k_guess[hard_ele_list] *= 100
@@ -387,7 +430,7 @@ if __name__ == "__main__":
         sigma_f=1e-1,
     )
 
-    ekf.L = torch.tensor(laplacian_mat, device="cuda", dtype=torch.float64)
+    # ekf.L = torch.tensor(laplacian_mat, device="cuda", dtype=torch.float64)
 
     # 模拟加权最小二乘 #
     dforce_dw_list = []
@@ -397,20 +440,21 @@ if __name__ == "__main__":
     contact_idx_list = []
     for i in range(len(dataset)):
         sample = dataset[i]
-        contact_idx = int(sample['contact_idx'])
+        contact_idx = sample['contact_idx']
         measure_node_force = sample['force'].to("cuda")[OBSERVE_NODES,:]
         measure_q = sample['post_x'][:, :2].to("cuda")
 
-        if contact_idx not in model_cache:
+        contact_key = tuple(contact_idx)
+        if contact_key not in model_cache:
             # construct soft body model #
             new_model = Soft2DForce(
                 shape=MESH_DATA, fix=FIXED_NODES, 
                 contact=contact_idx, E=1.e1, nu=0.3, dt=1.e-2, density=1.e1, device="cuda"
             )
-            model_cache[contact_idx] = new_model
-            print(f"Construct new model for contact idx: {contact_idx}")
+            model_cache[contact_key] = new_model
+            print(f"-> Construct new model for contact idx: {contact_idx}")
 
-        soft_model = model_cache[contact_idx]
+        soft_model = model_cache[contact_key]
 
         cut_indices = []
 
@@ -457,18 +501,18 @@ if __name__ == "__main__":
     #     measure_node_force = sample['force'].to("cuda")[OBSERVE_NODES,:]
     #     measure_q = sample['post_x'][:, :2].to("cuda")
 
-    #     if contact_idx not in model_cache:
+    #     if contact_key not in model_cache:
     #         # construct soft body model #
     #         new_model = Soft2DForce(
     #             shape=MESH_DATA, fix=FIXED_NODES, 
-    #             contact=contact_idx, E=1.e1, nu=0.3, dt=1.e-2, density=1.e1, device="cuda"
+    #             contact=contact_key, E=1.e1, nu=0.3, dt=1.e-2, density=1.e1, device="cuda"
     #         )
     #         # new_model.reconstruct_stretch_weight(init_w)
     #         # new_model.precomputation()
 
-    #         model_cache[contact_idx] = new_model
+    #         model_cache[contact_key] = new_model
 
-    #     soft_model = model_cache[contact_idx]
+    #     soft_model = model_cache[contact_key]
 
     #     # 1. 检测是否发生切割 (根据 sample info 或外部逻辑)
     #     # is_cutting = check_if_cutting(sample)
@@ -656,7 +700,7 @@ if __name__ == "__main__":
     fig, ax1 = plt.subplots(1, 1, figsize=(6, 5), constrained_layout=True)
     im1 = ax1.tripcolor(node_pos_np[:, 0], node_pos_np[:, 1], triangles, 
                         facecolors=np.log10(variance), shading='flat', 
-                        edgecolors='#333333', linewidth=0.7, alpha=0.9, cmap=cmap_custom,    # 
+                        edgecolors='#333333', linewidth=1., alpha=0.9, cmap=cmap_custom,    # 
                         vmin=tick_locs[0], vmax=tick_locs[-1])
     # ax1.set_title('(b) Graph Cut Segmentation (Output)', pad=15)
     ax1.set_aspect('equal')
@@ -664,7 +708,7 @@ if __name__ == "__main__":
 
     # 自定义 Colorbar 的刻度
     cbar1 = plt.colorbar(im1, ax=ax1, pad=0.01, shrink=0.8, aspect=20, fraction=0.046)
-    cbar1.ax.tick_params(length=0)
+    cbar1.ax.tick_params(length=0, labelsize=14)
 
     cbar1.set_ticks(tick_locs)
     cbar1.set_ticklabels([f"$10^{{ {int(loc):d} }}$" for loc in tick_locs])
@@ -678,14 +722,14 @@ if __name__ == "__main__":
     fig, ax1 = plt.subplots(1, 1, figsize=(6, 5), constrained_layout=True)
     im2 = ax1.tripcolor(node_pos_np[:, 0], node_pos_np[:, 1], triangles,
                         facecolors=np.log10(raw_k), shading='flat', 
-                        edgecolors='#333333', linewidth=0.7, alpha=0.9, cmap=cmap_custom,    # 
+                        edgecolors='#333333', linewidth=1., alpha=0.9, cmap=cmap_custom,    # 
                         )
     ax1.set_aspect('equal')
     ax1.axis('off')
 
     # 自定义 Colorbar 的刻度
     cbar1 = plt.colorbar(im2, ax=ax1, pad=0.01, shrink=0.8, aspect=20, fraction=0.046)
-    cbar1.ax.tick_params(length=0)
+    cbar1.ax.tick_params(length=0, labelsize=14)
 
     cbar1.set_ticks(tick_locs[::10])
     cbar1.set_ticklabels([f"$10^{{ {int(loc):d} }}$" for loc in tick_locs[::10]])
