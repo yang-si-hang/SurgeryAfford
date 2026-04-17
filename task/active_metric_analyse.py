@@ -5,18 +5,21 @@ import matplotlib.pyplot as plt
 from utilize.mesh_io import read_mshv2_triangular
 from const import *
 
-with open(OUTPUT_DIR / "evaluation_results_3_1.pkl", 'rb') as f:
+with open(OUTPUT_DIR / "strain" / "results-real-1.pkl", 'rb') as f:
+# with open(OUTPUT_DIR / "strain-weighted" / "evaluation_results-real-2.pkl", 'rb') as f:
     loaded_results = pickle.load(f)
 
-max_entropy_reduction = max(loaded_results.items(), key=lambda x: x[1]['entropy_reduction'])
-print(f"Contact Index with Max Entropy Reduction: {max_entropy_reduction[0]}")
-print(f"Max Entropy Reduction: {max_entropy_reduction[1]['entropy_reduction']:.4f}")
-print(f"Corresponding Action: {max_entropy_reduction[1]['optimal_action']}")
+# max_entropy_reduction = max(loaded_results.items(), key=lambda x: x[1]['entropy_reduction'])
+# print(f"Contact Index with Max Entropy Reduction: {max_entropy_reduction[0]}")
+# print(f"Max Entropy Reduction: {max_entropy_reduction[1]['entropy_reduction']:.4f}")
+# print(f"Corresponding Action: {max_entropy_reduction[1]['optimal_action']}")
 
 max_loss_increment = max(loaded_results.items(), key=lambda x: x[1]['fun_increment'])
 print(f"\nContact Index with Max Loss Increment: {max_loss_increment[0]}")
 print(f"Max Loss Increment: {max_loss_increment[1]['fun_increment']:.4f}")
 print(f"Corresponding Action: {max_loss_increment[1]['optimal_action']}")
+
+exit()
 
 # ==========================================
 # 1. 提取数据与相关性计算

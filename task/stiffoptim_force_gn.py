@@ -77,7 +77,8 @@ if __name__ == "__main__":
     lam = 1.e-6  # Hessian 正则化系数
 
     # load dataset #
-    demo_dir = DATA_DIR / "demo" / "pd_stretch_data_hete" / "20260215_hard[2]"
+    demo_dir = DATA_DIR / "demo" / "pd_stretch_data_hete" / "20260218_hard[3]"
+    # demo_dir = DATA_DIR / "results" / "sim-stiff-area-est" / "hard-1"
     dataset = HDF5PdDataset(data_directory=str(demo_dir))
     print(f"数据集加载完成，共包含 {len(dataset)} 个样本。")
 
@@ -113,7 +114,7 @@ if __name__ == "__main__":
         # if sample['step_idx'] != 19:
         #     continue  # 只使用每个轨迹的最后一个时间步数据
 
-        contact_idx = int(sample['contact_idx'])
+        contact_idx = sample['contact_idx']
         # pre_node_pos = sample['pre_x'].to('cuda')
         post_node_pos = sample['post_x'][:, :2].to('cuda')
         # action = sample['action'].to('cuda')
@@ -122,7 +123,8 @@ if __name__ == "__main__":
         OBSERVE_NODES = list(set(OBSERVE_NODES_INIT))
         OBSERVE_DOFS = np.stack([np.array(OBSERVE_NODES) * 2, np.array(OBSERVE_NODES) * 2 + 1], axis=-1).flatten().tolist()
 
-        if contact_idx not in model_cache:
+        contact_key = tuple(contact_idx)
+        if contact_key not in model_cache:
             # construct soft body model #
             new_model = Soft2DForce(
                 shape=MESH_DATA, fix=FIXED_NODES, 
@@ -131,9 +133,9 @@ if __name__ == "__main__":
             new_model.reconstruct_stretch_weight(init_w)
             new_model.precomputation()
 
-            model_cache[contact_idx] = new_model
+            model_cache[contact_key] = new_model
 
-        soft_model = model_cache[contact_idx]
+        soft_model = model_cache[contact_key]
 
         # soft_model.node_pos.from_numpy(pre_node_pos[:, 0:2].cpu().numpy())
         soft_model.node_pos.from_torch(post_node_pos)

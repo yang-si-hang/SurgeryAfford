@@ -573,14 +573,14 @@ class ActiveStiffnessPlanner:
         if not res.success:
             print(f"Optimization Warning: {res.message}")
 
-        node_pos_new = current_q_vision + (dq_du @ torch.from_numpy(res.x).to(self.device, dtype=torch.float64)).view(current_q_vision.shape)
+        # node_pos_new = current_q_vision + (dq_du @ torch.from_numpy(res.x).to(self.device, dtype=torch.float64)).view(current_q_vision.shape)
         # write_mshv2_triangular(OUTPUT_DIR / "optimized_mesh.msh", node_pos_new.cpu().numpy(), self.soft_model.ele.to_numpy())
-        cells = [("triangle", soft_model.ele.to_numpy().astype(np.int32))]
-        mesh = meshio.Mesh(
-            np.hstack([node_pos_new.cpu().numpy(), np.zeros((node_pos_new.shape[0], 1))]),
-            cells,
-        )
-        mesh.write(f"{OUTPUT_DIR}/optimized_mesh.vtu")
+        # cells = [("triangle", soft_model.ele.to_numpy().astype(np.int32))]
+        # mesh = meshio.Mesh(
+        #     np.hstack([node_pos_new.cpu().numpy(), np.zeros((node_pos_new.shape[0], 1))]),
+        #     cells,
+        # )
+        # mesh.write(f"{OUTPUT_DIR}/optimized_mesh.vtu")
 
         return res.x, -res.fun * loss_current
 
@@ -588,7 +588,7 @@ class ActiveStiffnessPlanner:
 if __name__ == "__main__":
     ti.init(arch=ti.cuda, debug=True)
 
-    demo_dir = DATA_DIR / "demo" / "pd_stretch_data_hete" / "20260221_215905"
+    demo_dir = DATA_DIR / "demo" / "pd_stretch_data_hete" / "20260414_200955"
     dataset = HDF5PdDataset(data_directory=str(demo_dir))
     print(f"数据集加载完成，共包含 {len(dataset)} 个样本。")
 
@@ -723,7 +723,7 @@ if __name__ == "__main__":
         print(f"Optimal Action: {optimal_action}; Magnitude: {np.linalg.norm(optimal_action):.4f}")
         print(f"Optimal Objective Function Value: {optimal_fun:.4f}; (Improvement: {increment:.4f})")
 
-        # 将动作代入EKF验证
+        ### 将动作代入EKF验证 ###
         step_num = 10    # 分为几步完成
         action_value = optimal_action / step_num
 
@@ -796,7 +796,7 @@ if __name__ == "__main__":
         }
     print(f"\nTotal Evaluation Time for {len(candidate_contact)} contacts: {time.time() - start_time:.4f} seconds")
 
-    save_path = OUTPUT_DIR / "evaluation_results_2_4.pkl"
+    save_path = OUTPUT_DIR / "strain" / "evaluation_results-1.pkl"
     with open(save_path, 'wb') as f:
         pickle.dump(evaluation_results, f)
     print(f"Results successfully saved to {save_path}")

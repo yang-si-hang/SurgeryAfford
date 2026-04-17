@@ -106,7 +106,7 @@ class HDF5PdDataset(Dataset):
                         # 'pre_x': q_prev_all[t],         # (N, 2)
                         'post_x': q_curr_all[t],        # (N, 2)
                         'action': act_val_all[t],       # (2,)
-                        'contact_idx': act_idx_all[t],  # (1,)
+                        'contact_idx': act_idx_all[t],  # (contact_num,)
                         'force': forces_field_all[t],    # (N, 2)
                         'step_idx': t,                  # 当前是第几步
                         'source_file': file_path.name   # 来源文件名
@@ -147,16 +147,19 @@ class HDF5PdDataset(Dataset):
         # 内存模式直接转换 Tensor
         # contact_idx 在 HDF5 中可能是数组形式 (1,)，需要转为 int 或 scalar tensor
         c_idx = sample_data['contact_idx']
-        # if isinstance(c_idx, (np.ndarray, list)):
-        #     c_idx = c_idx.item() # 转为 python scalar
-        if isinstance(c_idx, np.ndarray) and c_idx.size == 1:
-            c_idx = c_idx.item()  # 转为 python scalar
+        # # if isinstance(c_idx, (np.ndarray, list)):
+        # #     c_idx = c_idx.item() # 转为 python scalar
+        # if isinstance(c_idx, np.ndarray) and c_idx.size == 1:
+        #     c_idx = c_idx.item()  # 转为 python scalar
+
+        c_idx_array = np.atleast_1d(c_idx)
+        contact_idx_list = c_idx_array.tolist()
         
         return {
             # 'pre_x': torch.tensor(sample_data['pre_x'], dtype=torch.float32),
             'post_x': torch.tensor(sample_data['post_x'], dtype=torch.float32),
             'action': torch.tensor(sample_data['action'], dtype=torch.float32),
-            'contact_idx': list(c_idx),
+            'contact_idx': contact_idx_list,
             'force': torch.tensor(sample_data['force'], dtype=torch.float32),
             'step_idx': torch.tensor(sample_data['step_idx'], dtype=torch.long),
         }

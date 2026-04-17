@@ -2,12 +2,13 @@
 estimate stiffness field by using EKF
 Changelog:
 - 2026-01-14: Batch update implementation for EKF
-
+- 2026-04-02: Modify for real data
 Date: 2026-1-7
 """
 import numpy as np
 import taichi as ti
 import torch
+import h5py
 from sklearn.mixture import GaussianMixture
 import matplotlib.pyplot as plt
 import matplotlib.tri as mtri
@@ -15,7 +16,7 @@ import meshio
 from pathlib import Path
 from typing import List, Optional, Dict
 
-from const import ROOT_DIR, MESH_DIR, OUTPUT_DIR, DATA_DIR, VISUALIZATION_DIR, ARTICLE_VIS_DIR
+from const import *
 from deformation_model.diffpd_2d import Soft2D
 from deformation_model.pd_data_loader import HDF5PdDataset
 
@@ -27,6 +28,7 @@ class Soft2DForce(Soft2D):
         self.device = kwargs.pop('device', 'cuda')
         self.dforce_dw = ti.field(dtype=ti.f64, shape=(self.PARTICLE_N*2, self.ELEMENT_N))  # gradient of internal force wrt. stretch weight
         self.dforce_dq = ti.field(dtype=ti.f64, shape=(self.PARTICLE_N*2, self.PARTICLE_N*2))  # tangent stiffness matrix
+        self.strain_val = ti.field(dtype=ti.f64, shape=(self.ELEMENT_N,))  # 当前帧的整体应变值 (标量)
 
     @ti.kernel
     def cal_deformation_gradient(self):
@@ -77,6 +79,12 @@ class Soft2DForce(Soft2D):
     def reconstruct_stretch_weight(self, stretch_weight:ti.types.ndarray()):
         for f_i in range(self.ELEMENT_N):
             self.stretch_weight[f_i] = stretch_weight[f_i] * self.ele_volume[f_i]
+
+    @ti.kernel
+    def GL_strain(self, ):
+        for f_i in range(self.ELEMENT_N):
+            E = 0.5 * (self.F[f_i].transpose() @ self.F[f_i] - ti.Matrix.identity(ti.f64, 2))
+            self.strain_val[f_i] = ti.sqrt((E**2).sum()) 
 
 class StiffnessEKF:
     def __init__(self, 
@@ -242,6 +250,7 @@ class StiffnessEKF:
                      dforce_dq_list: List[torch.Tensor], 
                      internal_force_list: List[torch.Tensor], 
                      measured_f_ext_list: List[torch.Tensor],
+                     strain_val_list: List[torch.Tensor],
                      contact_idx_list: List[int]):
         """
         批量 EKF 更新 (基于信息滤波逻辑)
@@ -273,6 +282,7 @@ class StiffnessEKF:
             f_int_pred = internal_force_list[i].flatten()[self.obs_dofs]
             f_meas = measured_f_ext_list[i].flatten()
             contact_idx = contact_idx_list[i]
+            strain_val = strain_val_list[i].to(self.device)
 
             col_norms = torch.linalg.norm(dforce_dw_list[i][self.obs_dofs, :], dim=0) 
             accumulated_strain_metric += col_norms
@@ -384,26 +394,42 @@ def construct_laplacian_matrix(neighbors: np.ndarray) -> np.ndarray:
 if __name__ == "__main__":
     ti.init(arch=ti.cuda, debug=True)
 
-    # hard_area = [151, 174, 176, 177, 178, 179, 182, 186, 218, 219, 220, 306]
-    # free_area = []
+    SCALE = 6.e-4
     
     # load dataset #
-    demo_dir = DATA_DIR / "demo" / "pd_stretch_data_hete" / "20260414_200955"
-    # demo_dir = DATA_DIR / "results" / "sim-stiff-area-est" / "hard-3"
-    dataset = HDF5PdDataset(data_directory=str(demo_dir))
-    print(f"数据集加载完成，共包含 {len(dataset)} 个样本。")
+    demo_dir = DATA_DIR / "demo" / "real_track" / "04170230"
+    # dataset = HDF5PdDataset(data_directory=str(demo_dir))
+    # print(f"数据集加载完成，共包含 {len(dataset)} 个样本。")
 
-    # neighbor_info = np.loadtxt(f"{MESH_DIR}/pd_stretch_demo_mesh_neighbors.csv", delimiter=",", dtype=np.int32)
-    # laplacian_mat = construct_laplacian_matrix(neighbor_info)
+    # if len(dataset) == 0:
+    #     raise ValueError("Dataset is empty. Please check the data directory.")
 
-    if len(dataset) == 0:
-        raise ValueError("Dataset is empty. Please check the data directory.")
+    # MESH_DATA:dict = dataset.mesh_data
+    # FIXED_NODES = dataset.static_data['fix_nodes'].tolist()
+    # REAL_W = dataset.static_data['stiffness_truth']
+    # hard_ele_list = dataset.static_data['hard_ele_idx'].tolist()
+    # free_ele_list = dataset.static_data['free_ele_idx'].tolist()
 
-    MESH_DATA:dict = dataset.mesh_data
-    FIXED_NODES = dataset.static_data['fix_nodes'].tolist()
-    REAL_W = dataset.static_data['stiffness_truth']
-    hard_ele_list = dataset.static_data['hard_ele_idx'].tolist()
-    free_ele_list = dataset.static_data['free_ele_idx'].tolist()
+    with h5py.File(demo_dir / "test-2-cut_data.hdf5", 'r') as f:
+        # 读取轨迹
+        positions = f['trajectory_data/positions'][:] * SCALE  # (T, N, 2)
+        frames = f['trajectory_data/frame_indices'][:] # (T,)
+        
+        # 读取结构
+        faces = f['structure_data/faces'][:]           # (M, 3)
+        edges = f['structure_data/edges'][:]           # (E, 2)
+        init_pos = f['structure_data/initial_positions'][:] * SCALE # (N, 2)
+        
+        print(f"加载完成：{positions.shape[0]} 帧, {positions.shape[1]} 个节点")
+    
+    NUM = len(frames)
+    MESH_DATA = {
+        'F': faces,
+        'E': edges,
+        'V': init_pos,
+    }
+
+    FIXED_NODES = list(range(14, 30))
 
     NODE_NUM = MESH_DATA['V'].shape[0]
     FACE_NUM = MESH_DATA['F'].shape[0]
@@ -415,7 +441,6 @@ if __name__ == "__main__":
     faces_with_fixed = np.any(fixed_mask, axis=1)
     background_ele_list = np.where(faces_with_fixed)[0].tolist()
     np.savetxt(OUTPUT_DIR / "background_ele_list.csv", np.array(background_ele_list), delimiter=",", fmt="%d")
-    # print(f"Fixed Nodes: {FIXED_NODES}")
 
     # 使用 Dict[KeyType, ValueType]
     model_cache: Dict[tuple, Soft2DForce] = {}
@@ -431,7 +456,7 @@ if __name__ == "__main__":
         p_init_var=1.e20,
         q_process_noise=1.e3,
         sigma_q=1.e-3,
-        sigma_f=1e-1,
+        sigma_f=1.e-5,
     )
 
     # ekf.L = torch.tensor(laplacian_mat, device="cuda", dtype=torch.float64)
@@ -442,11 +467,18 @@ if __name__ == "__main__":
     internal_force_list = []
     measured_f_ext_list = []
     contact_idx_list = []
-    for i in range(len(dataset)):
-        sample = dataset[i]
-        contact_idx = sample['contact_idx']
-        measure_node_force = sample['force'].to("cuda")[OBSERVE_NODES,:]
-        measure_q = sample['post_x'][:, :2].to("cuda")
+    strain_val_list = []
+
+    # for i in range(len(dataset)):
+    for i in range(10):
+        # sample = dataset[i]
+        # contact_idx = sample['contact_idx']
+        # measure_node_force = sample['force'].to("cuda")[OBSERVE_NODES,:]
+        # measure_q = sample['post_x'][:, :2].to("cuda")
+
+        contact_idx = [43]
+        measure_node_force = torch.zeros(len(OBSERVE_NODES), 2, device="cuda")
+        measure_q = torch.from_numpy(positions[i]).to("cuda")
 
         contact_key = tuple(contact_idx)
         if contact_key not in model_cache:
@@ -474,85 +506,33 @@ if __name__ == "__main__":
 
         soft_model.hessian_stretch()
         soft_model.cal_internal_force_gradient_pos()    # 计算 dforce_dq
+
+        soft_model.GL_strain()
         
         # 4. EKF 更新
         dforce_dw_torch = soft_model.dforce_dw.to_torch(device="cuda").double()
         dforce_dq_torch = soft_model.dforce_dq.to_torch(device="cuda").double()
         internal_force_torch = soft_model.force.to_torch(device="cuda").double()
+        strain_val_torch = soft_model.strain_val.to_torch(device="cuda").double()
 
         dforce_dw_list.append(dforce_dw_torch)
         dforce_dq_list.append(dforce_dq_torch)
         internal_force_list.append(internal_force_torch)
         measured_f_ext_list.append(measure_node_force.double())
         contact_idx_list.append(contact_idx)
+        strain_val_list.append(strain_val_torch)
 
     ekf.batch_update(
         dforce_dw_list,
         dforce_dq_list,
         internal_force_list,
         measured_f_ext_list,
-        contact_idx_list
+        strain_val_list,
+        contact_idx_list,
+
     )
 
     current_k = ekf.get_stiffness()
-
-    ### 模拟时间循环 ###
-    # for i in range(len(dataset)):
-    #     sample = dataset[i]
-        
-    #     # 获取观测数据
-    #     contact_idx = int(sample['contact_idx'])
-    #     measure_node_force = sample['force'].to("cuda")[OBSERVE_NODES,:]
-    #     measure_q = sample['post_x'][:, :2].to("cuda")
-
-    #     if contact_key not in model_cache:
-    #         # construct soft body model #
-    #         new_model = Soft2DForce(
-    #             shape=MESH_DATA, fix=FIXED_NODES, 
-    #             contact=contact_key, E=1.e1, nu=0.3, dt=1.e-2, density=1.e1, device="cuda"
-    #         )
-    #         # new_model.reconstruct_stretch_weight(init_w)
-    #         # new_model.precomputation()
-
-    #         model_cache[contact_key] = new_model
-
-    #     soft_model = model_cache[contact_key]
-
-    #     # 1. 检测是否发生切割 (根据 sample info 或外部逻辑)
-    #     # is_cutting = check_if_cutting(sample)
-    #     # cut_indices = get_cut_indices(sample) if is_cutting else []
-    #     cut_indices = [] # 示例：暂无切割
-        
-    #     # 2. EKF 预测
-    #     # 默认拓扑改变只有切割
-    #     ekf.predict(cut_element_indices=cut_indices)
-        
-    #     # 3. 将预测的刚度注入物理模型，计算雅可比
-    #     current_k_belief = ekf.get_stiffness()
-    #     soft_model.reconstruct_stretch_weight(current_k_belief)
-    #     soft_model.precomputation() # 理论上只用计算stretch部分，因为没有正向模拟
-        
-    #     # 运行物理步 (Forward & Backward)
-    #     # [IMPORTANT] 确保这里的节点位置 q 是当前的观测位置，或者基于当前刚度平衡后的位置
-    #     # Static Equilibrium Identification，这里需要 solve equilibrium
-    #     soft_model.node_pos.from_torch(measure_q) # 使用观测位置
-
-    #     soft_model.cal_deformation_gradient()
-    #     soft_model.update_internal_force()
-    #     soft_model.cal_internal_force_gradient() # 计算 dforce_dw
-
-    #     soft_model.hessian_stretch()
-    #     soft_model.cal_internal_force_gradient_pos()    # 计算 dforce_dq
-
-    #     # 4. EKF 更新
-    #     dforce_dw_torch = soft_model.dforce_dw.to_torch(device="cuda").double()
-    #     dforce_dq_torch = soft_model.dforce_dq.to_torch(device="cuda").double()
-    #     internal_force_torch = soft_model.force.to_torch(device="cuda").double()
-    #     ekf.update(dforce_dw_torch, dforce_dq_torch, internal_force_torch, measure_node_force, contact_idx)
-        
-    #     # 5. 结果分析
-    #     current_k = ekf.get_stiffness()
-    #     print(f"Step {i}, Mean Stiffness: {torch.mean(current_k):.2f}")
 
     # 可视化最终结果 #
     # 可视化三角形网格每个单元的刚度值
@@ -568,25 +548,21 @@ if __name__ == "__main__":
     # np.savetxt(Path(OUTPUT_DIR) / "P_inv_matrix_ekf.csv", torch.linalg.inv(ekf.P).cpu().numpy(), delimiter=",")
     np.savetxt(Path(OUTPUT_DIR) / "P_diag_ekf.csv", P_diag, delimiter=",")
     np.savetxt(Path(OUTPUT_DIR) / "Y_ekf.csv", delta_Y, delimiter=",")
-    print(f"Saved EKF results to {OUTPUT_DIR}")
 
     print(f"Mean Variance of Stiffness Estimate: {np.mean(P_diag)}")
 
     cells = [("triangle", soft_model.ele.to_numpy().astype(np.int32))]
-    cells_size = soft_model.ele_volume.to_numpy()
 
     mesh = meshio.Mesh(
     soft_model.node_pos_init.to_numpy()[:, :2],
     cells,
     cell_data={
         "Stiffness": [raw_k],
-        "Uncertainty": [np.log10(np.sqrt(P_diag))],
+        "Uncertainty": [P_diag],
         "Information": [np.log10(np.sqrt(np.diag(delta_Y)))],
-        "information_normalized": [np.log10(np.sqrt(np.diag(delta_Y))) / cells_size],
     }
     )
     mesh.write(f"{OUTPUT_DIR}/mesh_with_stiffness.vtu")
-    print(f"Saved mesh with stiffness data to {OUTPUT_DIR}/mesh_with_stiffness.vtu")
 
     plt.figure(figsize=(6, 6))
     node_pos_np = soft_model.node_pos_init.to_numpy()[:, :2]  # Use post positions for deformed mesh
@@ -607,7 +583,7 @@ if __name__ == "__main__":
     plt.title(f'Stiffness per Element')
 
     out_path_stiff = Path(VISUALIZATION_DIR) / f"stiffness_ekf.svg"
-    plt.savefig(out_path_stiff, dpi=200)
+    plt.savefig(out_path_stiff, dpi=300)
     plt.close()
     print(f"Saved stiffness visualization to {out_path_stiff}")
 
@@ -620,12 +596,12 @@ if __name__ == "__main__":
     plt.title(f'Stiffness Variance per Element')
 
     out_path_var = Path(VISUALIZATION_DIR) / f"stiffness_variance_ekf.svg"
-    plt.savefig(out_path_var, dpi=200)
+    plt.savefig(out_path_var, dpi=300)
     plt.close()
     print(f"Saved stiffness variance visualization to {out_path_var}")
 
     plt.figure(figsize=(6, 6))
-    plt.tripcolor(triang, facecolors=np.log10(np.sqrt(delta_Y.diagonal())), cmap='RdBu_r', edgecolors='k')
+    plt.tripcolor(triang, facecolors=np.log10(np.sqrt(np.diag(delta_Y))), cmap='RdBu_r', edgecolors='k')
     plt.colorbar(label='Delta Y Diagonal')
     plt.gca().set_aspect('equal')
     plt.xlabel('x')
@@ -688,27 +664,6 @@ if __name__ == "__main__":
     cbar1.set_ticklabels([f"$10^{{ {int(loc):d} }}$" for loc in tick_locs])
 
     plt.savefig(f"{ARTICLE_VIS_DIR}/stiffness_variance.svg", transparent=True, format='svg', dpi=300, bbox_inches='tight')
-
-    # 可视化刚度值
-    # stiffness_show = 
-    v_min, v_max = raw_k.min(), raw_k.max()
-    tick_locs = np.arange(np.ceil(np.log10(v_min)), np.floor(np.log10(v_max)))
-    fig, ax1 = plt.subplots(1, 1, figsize=(6, 5), constrained_layout=True)
-    im2 = ax1.tripcolor(node_pos_np[:, 0], node_pos_np[:, 1], triangles,
-                        facecolors=np.log10(raw_k), shading='flat', 
-                        edgecolors='#333333', linewidth=1., alpha=0.9, cmap=cmap_custom,    # 
-                        )
-    ax1.set_aspect('equal')
-    ax1.axis('off')
-
-    # 自定义 Colorbar 的刻度
-    cbar1 = plt.colorbar(im2, ax=ax1, pad=0.01, shrink=0.8, aspect=20, fraction=0.046)
-    cbar1.ax.tick_params(length=0, labelsize=14)
-
-    cbar1.set_ticks(tick_locs[::10])
-    cbar1.set_ticklabels([f"$10^{{ {int(loc):d} }}$" for loc in tick_locs[::10]])
-
-    plt.savefig(f"{ARTICLE_VIS_DIR}/stiffness_value.svg", transparent=True, format='svg', dpi=300, bbox_inches='tight')
 
     inform = np.sqrt(np.diag(delta_Y))
     v_min, v_max = inform.min(), inform.max()

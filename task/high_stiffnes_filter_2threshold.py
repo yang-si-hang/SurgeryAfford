@@ -12,26 +12,29 @@ from pathlib import Path
 from utilize.mesh_io import read_mshv2_triangular
 from const import MESH_DIR, OUTPUT_DIR, VISUALIZATION_DIR, ARTICLE_VIS_DIR
 
-hard_ele_list = [151, 174, 176, 177, 178, 179, 182, 186, 218, 219, 220, 306]
+
+# tissue_2， 长条状
+# hard_ele_list = [66, 125, 138, 193, 197, 211, 219, 231, 234, 280, 284, 285, 290, 
+#                  298, 301, 344, 345, 370, 376]
+# demo_1, 长条状
 # hard_ele_list = [5, 6, 31, 86, 94, 124, 125, 131, 136, 140, 145, 151, 177, 
 #                  179, 185, 213, 219, 252, 255]
-# hard_ele_list = [48, 55, 63, 91, 94, 126, 128, 138, 174, 201, 204, 247, 250, 254, 255, 
-#                  256, 297, 327, 330, 379, 390, 391, 393, 396, 397, 401, 403, 412] + \
-#                 [238, 278, 287, 288, 359, 365, 366, 367, 370, 374, 414]
+# demo_2, 圆形状
+# hard_ele_list = [151, 174, 176, 177, 178, 179, 182, 186, 218, 219, 220, 306]
+# tissue_1, 圆形状 + 长条状
+hard_ele_list = [48, 55, 63, 91, 94, 126, 128, 138, 174, 201, 204, 247, 250, 254, 255, 
+                 256, 297, 327, 330, 379, 390, 391, 393, 396, 397, 401, 403, 412] + \
+                [238, 278, 287, 288, 359, 365, 366, 367, 370, 374, 414]
 
 neighbors_path = MESH_DIR / "pd_stretch_demo_mesh_neighbors.csv"
 neighbors = np.loadtxt(neighbors_path, delimiter=",")
 
-variance_path = OUTPUT_DIR / "P_diag_ekf.csv"
-variance_vec = np.loadtxt(variance_path, delimiter=",")
-variance = np.log10(np.sqrt(variance_vec))
-
-variance = np.loadtxt(f"{OUTPUT_DIR}/estimated_stiffness_ekf.csv", delimiter=",")
-variance = np.log10(variance)
+variance_vec = np.loadtxt(f"{OUTPUT_DIR}/estimated_stiffness_ekf.csv", delimiter=",")
+variance = np.log10(variance_vec)
 
 variance = np.loadtxt(f"{OUTPUT_DIR}/stretch_weight_update.csv", delimiter=",")
 
-mesh_path = MESH_DIR / "pd_stretch_demo_mesh_init.msh"
+mesh_path = MESH_DIR / "pd_stretch_tissue_mesh_init.msh"
 
 V, F = read_mshv2_triangular(mesh_path)
 mesh_data = {"V": V, "F": F}
@@ -41,6 +44,42 @@ edge_to_cells = {}
 for i, cell in enumerate(F):
     for edge in [tuple(sorted((cell[0], cell[1]))), tuple(sorted((cell[1], cell[2]))), tuple(sorted((cell[2], cell[0])))]:
         edge_to_cells.setdefault(edge, []).append(i)
+
+# ==========================================
+# 1.5. 网格标量场平滑 (Topological Smoothing)
+# ==========================================
+print("Step 0.5: Smoothing scalar field...")
+
+# a. 构建单元到单元的邻接表 (Cell-to-Cell Adjacency)
+cell_neighbors = {i: [] for i in range(n_cells)}
+for edge, cells in edge_to_cells.items():
+    if len(cells) == 2:
+        u, v = cells[0], cells[1]
+        cell_neighbors[u].append(v)
+        cell_neighbors[v].append(u)
+
+# b. 设置平滑参数
+SMOOTH_ITERATIONS = 1   # 迭代次数 (建议 1~3 次)
+ALPHA = 0.4             # 平滑强度 (0: 不平滑, 1: 完全等于邻居均值)
+
+smoothed_variance = variance.copy()
+
+for iteration in range(SMOOTH_ITERATIONS):
+    # 使用 temp 数组，确保每一轮更新都是基于上一轮的同步状态
+    temp_variance = smoothed_variance.copy() 
+    
+    for i in range(n_cells):
+        neighbors_idx = cell_neighbors[i]
+        if len(neighbors_idx) > 0:
+            # 计算相邻单元的均值
+            neighbor_avg = np.mean(temp_variance[neighbors_idx])
+            # 公式：(1 - alpha) * 当前值 + alpha * 邻居均值
+            smoothed_variance[i] = (1.0 - ALPHA) * temp_variance[i] + ALPHA * neighbor_avg
+
+# 将平滑后的结果覆盖回原变量，供后续 GMM 和 Graph Cut 使用
+variance = smoothed_variance
+
+print(f"  - Applied Laplacian smoothing with alpha={ALPHA}, iterations={SMOOTH_ITERATIONS}")
 
 # ==========================================
 # 2. GMM 概率建模 (Data Term)
@@ -71,7 +110,7 @@ prob_low = probs[:, low_uncertainty_idx]    # 属于低不确定性的概率
 prob_sink = prob_low
 
 # 防止 log(0) 错误，加一个极小值
-epsilon = 1e-10
+epsilon = 1e-2
 prob_high = np.clip(prob_high, epsilon, 1.0 - epsilon)
 prob_sink = np.clip(prob_sink, epsilon, 1.0 - epsilon)
 
@@ -88,7 +127,7 @@ print("Step 2: Building Graph...")
 # Lambda: 平滑系数。调节它来控制“分割块”的连续程度。
 # 越大，区域越整块（可能丢失细节）；越小，越破碎（接近单纯的阈值法）。
 # 经验值通常在 1.0 到 10.0 之间，需要根据 variance 的数值范围微调。
-LAMBDA = 3.0
+LAMBDA = 8.0
 # SIGMA = 0.5 # 用于高斯核计算相邻差异的权重
 
 diff_sq_sum = 0.0
@@ -170,7 +209,7 @@ print(f"Step 4: Done. Found {num_high} cells in high uncertainty region.")
 # ==========================================
 # 如果你想保存出哪些 ID 是高不确定性的
 high_uncertainty_indices = np.where(high_uncertainty_mask)[0]
-# np.savetxt(OUTPUT_DIR / "high_uncertainty_indices.csv", high_uncertainty_indices, fmt="%d")
+np.savetxt(OUTPUT_DIR / "high_uncertainty_indices.csv", high_uncertainty_indices, fmt="%d")
 
 fig, ax1 = plt.subplots(figsize=(6, 6))
 cmap_custom = plt.get_cmap('tab10', 2)
@@ -190,6 +229,100 @@ true_pos = np.intersect1d(high_uncertainty_indices, hard_ele_list)
 precision = len(true_pos) / num_high if num_high > 0 else 0
 recall = len(true_pos) / len(hard_ele_list) if len(hard_ele_list) > 0 else 0
 print(f"Precision: {precision:.4f}, Recall: {recall:.4f}")
+
+# ==========================================
+# 独立于分类算法的纯场量评估 (Field-Level Metrics)
+# ==========================================
+print("\nStep: Evaluating Raw Uncertainty Field vs Ground Truth...")
+
+# 1. 准备真实的 Ground Truth Mask
+gt_mask = np.zeros(n_cells, dtype=bool)
+gt_mask[hard_ele_list] = True
+
+# 排除 fixed 节点？二分类版本未定义 fixed_ele_list，故默认全部参与评估
+# 若后续有 fixed 单元，可在此处添加：
+# fixed_ele_list = [...]  # 如有
+# eval_mask = np.ones(n_cells, dtype=bool)
+# eval_mask[fixed_ele_list] = False
+# 否则：
+eval_mask = np.ones(n_cells, dtype=bool)
+
+# 提取用于评估的真值和标量场
+y_true = gt_mask[eval_mask]
+y_score = variance[eval_mask]  # 使用对数标准差作为评分
+
+from sklearn.metrics import roc_auc_score, average_precision_score
+
+# ---------------------------------------------------------
+# 指标 1: ROC-AUC
+# ---------------------------------------------------------
+try:
+    auc_score = roc_auc_score(y_true, y_score)
+    print(f"  [Field Metric 1] ROC-AUC: {auc_score:.4f} (Closer to 1.0 is better)")
+except ValueError as e:
+    print(f"  [Field Metric 1] ROC-AUC: N/A ({e})")
+
+# ---------------------------------------------------------
+# 指标 2: Average Precision
+# ---------------------------------------------------------
+try:
+    ap_score = average_precision_score(y_true, y_score)
+    print(f"  [Field Metric 2] Average Precision (PR-AUC): {ap_score:.4f} (Higher is better)")
+except ValueError as e:
+    print(f"  [Field Metric 2] Average Precision: N/A ({e})")
+
+# ---------------------------------------------------------
+# 指标 3: GT-based Log-CNR
+# ---------------------------------------------------------
+gt_target_values = variance[gt_mask & eval_mask]
+gt_bg_values = variance[(~gt_mask) & eval_mask]
+
+if len(gt_target_values) > 0 and len(gt_bg_values) > 0:
+    mean_gt_target = np.mean(gt_target_values)
+    mean_gt_bg = np.mean(gt_bg_values)
+    std_gt_bg = np.std(gt_bg_values)
+    
+    gt_log_cnr = np.abs(mean_gt_target - mean_gt_bg) / (std_gt_bg + 1e-10)
+    print(f"  [Field Metric 3] GT-based Log-CNR: {gt_log_cnr:.4f} (Higher means better signal contrast)")
+else:
+    print("  [Field Metric 3] GT-based Log-CNR: N/A (Missing target or background regions)")
+
+# ---------------------------------------------------------
+# 获取原始线性尺度的值（用于指标5）, TODO: 变量名有误
+linear_std = variance_vec
+
+gt_linear_target = linear_std[gt_mask & eval_mask]
+gt_linear_bg = linear_std[(~gt_mask) & eval_mask]
+
+gt_log_target = variance[gt_mask & eval_mask]
+gt_log_bg = variance[(~gt_mask) & eval_mask]
+
+if len(gt_log_target) > 0 and len(gt_log_bg) > 0:
+    # ---------------------------------------------------------
+    # 指标 4: GT-based FDR（对数空间）
+    # ---------------------------------------------------------
+    mean_gt_log_target = np.mean(gt_log_target)
+    mean_gt_log_bg = np.mean(gt_log_bg)
+    var_gt_log_target = np.var(gt_log_target)
+    var_gt_log_bg = np.var(gt_log_bg)
+    
+    fdr_gt = ((mean_gt_log_target - mean_gt_log_bg)**2) / (var_gt_log_target + var_gt_log_bg + 1e-10)
+    print(f"  [Field Metric 4] GT-based FDR: {fdr_gt:.4f} (Higher means better statistical separability)")
+
+    # ---------------------------------------------------------
+    # 指标 5: GT-based Background Suppression Ratio（线性空间）
+    # ---------------------------------------------------------
+    mean_gt_linear_target = np.mean(gt_linear_target)
+    mean_gt_linear_bg = np.mean(gt_linear_bg)
+    
+    ratio_gt = mean_gt_linear_target / (mean_gt_linear_bg + 1e-10)
+    log_ratio = np.log10(np.mean(gt_linear_target) + 1e-10) - np.log10(np.mean(gt_linear_bg) + 1e-10)
+    print(f"  [Field Metric 5] GT-based Suppression Ratio: {ratio_gt:.4f} (Higher means target is relatively enhanced)")
+    print(f"  [Field Metric 5] GT-based Log Suppression Ratio: {log_ratio:.4f}")
+
+else:
+    print("  [Field Metrics 4-5] N/A (Missing target or background regions in GT)")
+
 
 # ==========================================
 # 论文结果美化代码

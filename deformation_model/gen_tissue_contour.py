@@ -12,7 +12,7 @@ from utilize.gen_mesh import MaskTo2DMesh
 from utilize.mesh_io import write_mshv2_triangular
 from const import MESH_DIR
 
-def generate_tissue_mask(image_size=400, base_radius=120, noise=40, num_ctrl_points=7):
+def generate_tissue_mask(image_size=400, base_radius=100, noise=40, num_ctrl_points=7):
     """
     生成一个逼真的软组织二维 Mask 和轮廓坐标
     """
@@ -43,13 +43,26 @@ def generate_tissue_mask(image_size=400, base_radius=120, noise=40, num_ctrl_poi
     mask = np.zeros((image_size, image_size), dtype=np.uint8)
     cv2.fillPoly(mask, [contour_points], 255)
     
-    return mask, contour_points
+    return mask, contour_points, tck
+
+def export_xyz(points, filename="points.txt"):
+    with open(filename, "w") as f:
+        for x, y in points:
+            f.write(f"{float(x):.3f} {float(y):.3f} 0\n")
+    print(f"XYZ 点文件已保存为 {filename}")
+
 
 # ================= 测试运行 =================
 if __name__ == "__main__":
     # 生成 Mask 和 轮廓点
-    tissue_mask, contour = generate_tissue_mask()
-    np.savetxt("contour_points.csv", contour, fmt="%d", delimiter=",")  # 保存轮廓点为 CSV 文件
+    tissue_mask, contour, tck = generate_tissue_mask()
+    knots, coeffs, degree = tck
+    np.savez("contour_data.npz", knots=knots, coeffs=coeffs, degree=degree)
+    cv2.imwrite("tissue_mask.png", tissue_mask)
+
+    contour_u = np.linspace(0, 1, 500)
+    contour_x, contour_y = splev(contour_u, tck)
+    export_xyz(np.column_stack((contour_x, contour_y)), filename="contour_points.txt")  # 保存为 XYZ 格式
     
     mesher = MaskTo2DMesh(
         boundary_resolution=50, 
@@ -61,7 +74,7 @@ if __name__ == "__main__":
     V, F = mesher.generate_mesh(tissue_mask)
     V = V * 1.e-3  # 缩放到合适尺寸
 
-    mesh_file = f"{MESH_DIR}/pd_stretch_tissue_mesh_init_2.msh"
+    mesh_file = f"{MESH_DIR}/real_tissue-0.msh"
     write_mshv2_triangular(f"{mesh_file}", V, F)
 
     # 保存为 meshio 格式

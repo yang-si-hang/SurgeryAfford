@@ -9,11 +9,14 @@ import pickle
 import taichi as ti
 import meshio
 import torch
+
+from utilize.mesh_util import extract_edge_from_face
 torch.set_printoptions(linewidth=120)
 import numpy as np
 np.set_printoptions(linewidth=120)
 from typing import Dict, List, Tuple
 from scipy.optimize import minimize, NonlinearConstraint, Bounds
+from scipy.linalg import cho_factor, cho_solve
 
 from stiffoptim_force_ekf import Soft2DForce, StiffnessEKF
 from deformation_model.pd_data_loader import HDF5PdDataset
@@ -316,10 +319,10 @@ class Soft2DForceExtended(Soft2DForce):
 class ActiveStiffnessPlanner:
     def __init__(self, 
                  soft_model: Soft2DForceExtended, 
-                 estimator: StiffnessEKF,
+                #  estimator: StiffnessEKF,
                  device="cuda"):
         self.soft_model = soft_model
-        self.estimator = estimator
+        # self.estimator = estimator
         self.device = device
 
     def visualize_loss_landscape(self, dF_du, P_prior, max_mag=0.03):
@@ -429,9 +432,10 @@ class ActiveStiffnessPlanner:
         plt.close()
 
     def optimize_action(self, 
+                        P_row_sum: torch.Tensor,
                         current_q_vision: torch.Tensor,
                         current_stiffness_est: torch.Tensor,
-                        weighted_cells: List[int],
+                        # weighted_cells: List[int],
                         max_action_mag: float = 0.03,
                         optimize_options: Dict = None,):
         """
@@ -463,11 +467,11 @@ class ActiveStiffnessPlanner:
         # np.savetxt(OUTPUT_DIR / "dH_du_act0.csv", dH_du[:, :, 0].cpu().numpy(), delimiter=",")
         # np.savetxt(OUTPUT_DIR / "dH_du_act1.csv", dH_du[:, :, 1].cpu().numpy(), delimiter=",")
         
-        P_prior = self.estimator.P
-        P_row_sum = torch.sum(P_prior**2, dim=1)
-        weight = torch.ones((self.soft_model.ELEMENT_N,), device=self.device, dtype=torch.float64)
-        weight[weighted_cells] = 5.0  # 加大这些单元的权重
-        P_row_sum = P_row_sum * weight
+        # P_prior = self.estimator.P
+        # P_row_sum = torch.sum(P_prior**2, dim=1)
+        # weight = torch.ones((self.soft_model.ELEMENT_N,), device=self.device, dtype=torch.float64)
+        # weight[weighted_cells] = 5.0  # 加大这些单元的权重
+        # P_row_sum = P_row_sum * weight
         # Y_prior = self.estimator.delta_Y
         # weight = 1.0 / (torch.diag(Y_prior) + 1.e-6)
         # P_row_sum = weight
@@ -590,20 +594,27 @@ class ActiveStiffnessPlanner:
 
 
 if __name__ == "__main__":
-    ti.init(arch=ti.cuda, debug=True)
+    ti.init(arch=ti.cuda, debug=True, device_memory_GB=10)
 
-    demo_dir = DATA_DIR / "demo" / "pd_stretch_data_hete" / "20260414_200955"
-    dataset = HDF5PdDataset(data_directory=str(demo_dir))
-    print(f"数据集加载完成，共包含 {len(dataset)} 个样本。")
+    SCALE = 5.e-4
+    demo_dir = DATA_DIR / "demo" / "real_track" / "04152030"
 
-    if len(dataset) == 0:
-        raise ValueError("Dataset is empty. Please check the data directory.")
+    mesh_data_file = np.load(DATA_DIR / "demo" / "real_track" / "04152030" / "tissue_mesh.npz")
+    neighbors = mesh_data_file['neighbors']
+    V, F = mesh_data_file['vertices'], mesh_data_file['faces']
+    edges = extract_edge_from_face(F)
+    MESH_DATA = {"V": V*SCALE, "F": F, "E": edges}
 
-    MESH_DATA:dict = dataset.mesh_data
-    FIXED_NODES = dataset.static_data['fix_nodes'].tolist()
-    REAL_W = dataset.static_data['stiffness_truth']
-    hard_ele_list = dataset.static_data['hard_ele_idx'].tolist()
-    free_ele_list = dataset.static_data['free_ele_idx'].tolist()
+    Y_sum = np.loadtxt(demo_dir / "Y_sum_ekf.csv", delimiter=",")
+
+    FIXED_NODES = list(range(40, 65))
+    candidate_contact = list(set(range(0, 78)) - set(FIXED_NODES))
+    CON_NODES = [22, 23, 4, 5]
+    contact_cells = []
+    for i, face in enumerate(F):
+        if any(node in candidate_contact for node in face):
+            contact_cells.append(i)
+    print(f"Contact cells: {contact_cells}")
 
     NODE_NUM = MESH_DATA['V'].shape[0]
     FACE_NUM = MESH_DATA['F'].shape[0]
@@ -611,84 +622,16 @@ if __name__ == "__main__":
     OBSERVE_DOFS = np.stack([np.array(OBSERVE_NODES) * 2, np.array(OBSERVE_NODES) * 2 + 1], axis=-1).flatten().tolist()
     OBSERVE_DICT = {node_idx: i for i, node_idx in enumerate(OBSERVE_NODES)}
 
-    model_cache: Dict[int, Soft2DForceExtended] = {}
-    
-    init_k_guess = torch.ones(FACE_NUM, device="cuda") * 400.0 # 初始猜测
+    c, lower = cho_factor(Y_sum + np.eye(FACE_NUM) * 1e-6)
+    P_mat = cho_solve((c, lower), np.eye(Y_sum.shape[0]))
+    P_prior = torch.tensor(P_mat, device="cuda", dtype=torch.float64)
+    P_row_sum = torch.sum(P_prior**2, dim=1)
+    P_row_sum[contact_cells] = 0.0  # 将受约束的节点对应的行权重设为0，避免优化倾向于增加这些节点的应变
 
-    ekf = StiffnessEKF(
-        mesh_info={"PARTICLE_N": NODE_NUM, "ELEMENT_N": FACE_NUM},
-        initial_stiffness=init_k_guess,
-        observe_nodes=OBSERVE_NODES,
-        p_init_var=1.e20,
-        q_process_noise=1.e3,
-        sigma_q=1.e-4,
-        sigma_f=1e-1,
-    )
-
-    # 模拟加权最小二乘 #
-    dforce_dw_list = []
-    dforce_dq_list = []
-    internal_force_list = []
-    measured_f_ext_list = []
-    contact_idx_list = []
-    for i in range(len(dataset)):
-        sample = dataset[i]
-        contact_idx = sample['contact_idx']
-        measure_node_force = sample['force'].to("cuda")[OBSERVE_NODES,:]
-        measure_q = sample['post_x'][:, :2].to("cuda")
-
-        contact_key = tuple(contact_idx)
-        if contact_key not in model_cache:
-            # construct soft body model #
-            new_model = Soft2DForce(
-                shape=MESH_DATA, fix=FIXED_NODES, 
-                contact=contact_idx, E=1.e1, nu=0.3, dt=1.e-2, density=1.e1, device="cuda",
-            )
-            model_cache[contact_key] = new_model
-            print(f"-> Construct new model for contact idx: {contact_idx}")
-
-        soft_model = model_cache[contact_key]
-
-        cut_indices = []
-
-        soft_model.reconstruct_stretch_weight(init_k_guess)
-        soft_model.precomputation()
-
-        # 运行物理步 (Forward & Backward)
-        soft_model.node_pos.from_torch(measure_q) # 使用观测位置
-
-        soft_model.cal_deformation_gradient()
-        soft_model.update_internal_force()
-        soft_model.cal_internal_force_gradient() # 计算 dforce_dw
-
-        soft_model.hessian_stretch()
-        soft_model.cal_internal_force_gradient_pos()    # 计算 dforce_dq
-
-        # 4. EKF 更新
-        dforce_dw_torch = soft_model.dforce_dw.to_torch(device="cuda").double()
-        dforce_dq_torch = soft_model.dforce_dq.to_torch(device="cuda").double()
-        internal_force_torch = soft_model.force.to_torch(device="cuda").double()
-
-        dforce_dw_list.append(dforce_dw_torch)
-        dforce_dq_list.append(dforce_dq_torch)
-        internal_force_list.append(internal_force_torch)
-        measured_f_ext_list.append(measure_node_force.double())
-        contact_idx_list.append(contact_idx)
-
-    ekf.batch_update(
-        dforce_dw_list,
-        dforce_dq_list,
-        internal_force_list,
-        measured_f_ext_list,
-        contact_idx_list
-    )
-    
     # edge_celles = [44, 58, 74, 85, 87, 90, 91, 130, 138, 142, 319]
     # high_stiff_celles = np.loadtxt(OUTPUT_DIR / "high_uncertainty_indices.csv", delimiter=",", dtype=int).tolist()
     high_stiff_celles = np.loadtxt(OUTPUT_DIR / "low_value_indices.csv", delimiter=",", dtype=int).tolist()
 
-    P_prior = ekf.P
-    P_row_sum = torch.sum(P_prior**2, dim=1)
     weight = torch.ones((FACE_NUM, ), device="cuda", dtype=torch.float64)
     weight[high_stiff_celles] = 5.0
     P_row_sum = P_row_sum * weight
@@ -699,18 +642,17 @@ if __name__ == "__main__":
     loss_current = torch.sqrt(torch.dot(P_row_sum, sig_sum)).item()
     print(f"Initial Loss (|S_(t+1) Σ_t|): {loss_current:.4f}")
 
-    entropy_prior = ekf.get_entropy()
-    print(f"=> Posterior Entropy: {entropy_prior:.4f}")
-    np.savetxt(OUTPUT_DIR / "P_matrix_ekf.csv", ekf.P.cpu().numpy(), delimiter=",")
+    # entropy_prior = ekf.get_entropy()
+    # print(f"=> Posterior Entropy: {entropy_prior:.4f}")
+    # np.savetxt(OUTPUT_DIR / "P_matrix_ekf.csv", ekf.P.cpu().numpy(), delimiter=",")
 
-    candidate_contact = list(set(range(1, 50)) - set(FIXED_NODES))
     evaluation_results = {}
 
-    ekf_base = ekf
+    # ekf_base = ekf
     start_time = time.time()
     for contact_idx in candidate_contact:
         print(f"\n{'='*5} Evaluating Candidate Contact {contact_idx} {'='*5}")
-        ekf_candidate = ekf_base.clone()
+        # ekf_candidate = ekf_base.clone()
 
         soft_init_model = Soft2DForceExtended(
                     shape=MESH_DATA, fix=FIXED_NODES, 
@@ -718,16 +660,17 @@ if __name__ == "__main__":
                     device="cuda", print_info=False
                 )
 
-        planner = ActiveStiffnessPlanner(soft_init_model, ekf_candidate)
+        planner = ActiveStiffnessPlanner(soft_init_model)
 
         vision_q_tensor = soft_init_model.node_pos_init.to_torch(device="cuda").double()
 
         time_start = time.time()
         optimal_action, optimal_fun = planner.optimize_action(
+            P_row_sum=P_row_sum,
             current_q_vision=vision_q_tensor,
             current_stiffness_est=torch.ones(FACE_NUM, device="cuda") * 400.0,
-            weighted_cells = high_stiff_celles,
-            max_action_mag=0.06,
+            # weighted_cells = high_stiff_celles,
+            max_action_mag=0.1,
             optimize_options = {
                 "method": 'SLSQP',  # 'SLSQP' or 'trust-constr'
                 "iter_num": 100,
@@ -742,13 +685,13 @@ if __name__ == "__main__":
         evaluation_results[contact_idx] = {
             'optimal_action': optimal_action,
             'fun_increment': increment,
-            'entropy_reduction': 1.,
-            'covariance': ekf_candidate.P.cpu().numpy()
+            # 'entropy_reduction': 1.,
+            # 'covariance': ekf_candidate.P.cpu().numpy()
         }
 
     print(f"\nTotal Evaluation Time for {len(candidate_contact)} contacts: {time.time() - start_time:.4f} seconds")
 
-    save_path = OUTPUT_DIR / "strain-weighted" / "evaluation_results-1.pkl"
+    save_path = OUTPUT_DIR / "strain-weighted" / "evaluation_results-real-2.pkl"
     with open(save_path, 'wb') as f:
         pickle.dump(evaluation_results, f)
     print(f"Results successfully saved to {save_path}")

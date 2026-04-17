@@ -80,6 +80,7 @@ class Soft2D:
         self.node_voronoi  = ti.field(dtype=ti.f64, shape=self.PARTICLE_N)
         self.node_mass     = ti.field(dtype=ti.f64, shape=self.PARTICLE_N)
         self.node_mass_sum = ti.field(dtype=ti.f64, shape=())
+        self.volume_sum = ti.field(dtype=ti.f64, shape=())
         self.node_pos_init.from_numpy(node_np[:,:2].astype(np.float64))
         self.node_pos.from_numpy(node_np[:,:2].astype(np.float64))
 
@@ -169,6 +170,7 @@ class Soft2D:
         for q_i in range(self.PARTICLE_N):
             self.node_mass[q_i] = self.density * self.node_voronoi[q_i]
             self.node_mass_sum[None] += self.node_mass[q_i]
+        self.volume_sum[None] = self.node_mass_sum[None] / self.density
         if self.print_info:
             print(f"Node mass sum: {self.node_mass_sum[None]:.3f}")
 
