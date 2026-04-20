@@ -748,7 +748,7 @@ if __name__ == "__main__":
 
     print(f"\nTotal Evaluation Time for {len(candidate_contact)} contacts: {time.time() - start_time:.4f} seconds")
 
-    save_path = OUTPUT_DIR / "strain-weighted" / "evaluation_results-1.pkl"
+    save_path = OUTPUT_DIR / "strain-weighted" / "evaluation_results-2.pkl"
     with open(save_path, 'wb') as f:
         pickle.dump(evaluation_results, f)
     print(f"Results successfully saved to {save_path}")

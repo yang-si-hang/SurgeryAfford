@@ -720,7 +720,7 @@ class ActiveStiffnessPlanner:
 if __name__ == "__main__":
     ti.init(arch=ti.cuda, debug=True)
 
-    demo_dir = DATA_DIR / "demo" / "pd_stretch_data_hete" / "20260221_215905_active-strain[2]"
+    demo_dir = DATA_DIR / "demo" / "pd_stretch_data_hete" / "20260414_200955"
     dataset = HDF5PdDataset(data_directory=str(demo_dir))
     print(f"数据集加载完成，共包含 {len(dataset)} 个样本。")
 
@@ -867,7 +867,7 @@ if __name__ == "__main__":
 
     print(f"\nTotal Evaluation Time for {len(candidate_contact)} contacts: {time.time() - start_time:.4f} seconds")
 
-    save_path = OUTPUT_DIR / "evaluation_results_3_1.pkl"
+    save_path = OUTPUT_DIR / "entropy" /"evaluation_results_1.pkl"
     with open(save_path, 'wb') as f:
         pickle.dump(evaluation_results, f)
     print(f"Results successfully saved to {save_path}")

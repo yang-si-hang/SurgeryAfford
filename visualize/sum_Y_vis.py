@@ -8,6 +8,7 @@ import glob
 import h5py
 import numpy as np
 from scipy.linalg import cho_factor, cho_solve, solve
+import meshio
 import matplotlib.pyplot as plt
 import matplotlib.tri as mtri
 
@@ -15,7 +16,7 @@ from const import *
 from utilize.mesh_io import read_mshv2_triangular, write_mshv2_triangular
 
 
-FILE_DIR = DATA_DIR / "demo" / "real_track" / "04170230"
+FILE_DIR = DATA_DIR / "demo" / "real_track" / "04152030"
 mesh_data_file = np.load(FILE_DIR / "tissue_mesh.npz")
 neighbors = mesh_data_file['neighbors']
 V, F = mesh_data_file['vertices'], mesh_data_file['faces']
@@ -45,10 +46,22 @@ else:
 
         print(f"  已读取: {os.path.basename(file_path)}, 形状: {mat.shape}")
 
-# P_mat = solve(total_matrix, np.eye(total_matrix.shape[0]))
 c, lower = cho_factor(total_matrix)
 P_mat = cho_solve((c, lower), np.eye(total_matrix.shape[0]))
 np.savetxt(Path(OUTPUT_DIR) / "Y_sum_ekf.csv", total_matrix, delimiter=",")
+np.savetxt(Path(OUTPUT_DIR) / "P_sum_ekf.csv", P_mat, delimiter=",")
+
+cells = [("triangle", F.astype(np.int32))]
+mesh = meshio.Mesh(
+V[:, :2],
+cells,
+cell_data={
+    "Uncertainty": [np.log10(np.sqrt(np.diag(P_mat)))],
+    "Information": [np.log10(np.sqrt(np.diag(total_matrix)))],
+}
+)
+mesh.write(f"{OUTPUT_DIR}/mesh_with_stiffness.vtu")
+print(f"Saved mesh with stiffness information to {OUTPUT_DIR}/mesh_with_stiffness.vtu")
 
 triang = mtri.Triangulation(V[:, 0], V[:, 1], F)
 

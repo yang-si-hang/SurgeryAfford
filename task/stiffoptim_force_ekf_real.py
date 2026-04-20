@@ -398,19 +398,8 @@ if __name__ == "__main__":
     
     # load dataset #
     demo_dir = DATA_DIR / "demo" / "real_track" / "04170230"
-    # dataset = HDF5PdDataset(data_directory=str(demo_dir))
-    # print(f"数据集加载完成，共包含 {len(dataset)} 个样本。")
 
-    # if len(dataset) == 0:
-    #     raise ValueError("Dataset is empty. Please check the data directory.")
-
-    # MESH_DATA:dict = dataset.mesh_data
-    # FIXED_NODES = dataset.static_data['fix_nodes'].tolist()
-    # REAL_W = dataset.static_data['stiffness_truth']
-    # hard_ele_list = dataset.static_data['hard_ele_idx'].tolist()
-    # free_ele_list = dataset.static_data['free_ele_idx'].tolist()
-
-    with h5py.File(demo_dir / "test-2-cut_data.hdf5", 'r') as f:
+    with h5py.File(demo_dir / "test-5-cut_data.hdf5", 'r') as f:
         # 读取轨迹
         positions = f['trajectory_data/positions'][:] * SCALE  # (T, N, 2)
         frames = f['trajectory_data/frame_indices'][:] # (T,)
@@ -547,7 +536,7 @@ if __name__ == "__main__":
     np.savetxt(Path(OUTPUT_DIR) / "P_matrix_ekf.csv", ekf.P.cpu().numpy(), delimiter=",")
     # np.savetxt(Path(OUTPUT_DIR) / "P_inv_matrix_ekf.csv", torch.linalg.inv(ekf.P).cpu().numpy(), delimiter=",")
     np.savetxt(Path(OUTPUT_DIR) / "P_diag_ekf.csv", P_diag, delimiter=",")
-    np.savetxt(Path(OUTPUT_DIR) / "Y_ekf.csv", delta_Y, delimiter=",")
+    np.savetxt(Path(demo_dir) / "Y_ekf.csv", delta_Y, delimiter=",")
 
     print(f"Mean Variance of Stiffness Estimate: {np.mean(P_diag)}")
 

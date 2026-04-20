@@ -388,7 +388,7 @@ if __name__ == "__main__":
     # free_area = []
     
     # load dataset #
-    demo_dir = DATA_DIR / "demo" / "pd_stretch_data_hete" / "20260414_200955"
+    demo_dir = DATA_DIR / "demo" / "pd_stretch_data_hete" / "20260218_hard[3]"
     # demo_dir = DATA_DIR / "results" / "sim-stiff-area-est" / "hard-3"
     dataset = HDF5PdDataset(data_directory=str(demo_dir))
     print(f"数据集加载完成，共包含 {len(dataset)} 个样本。")

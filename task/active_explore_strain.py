@@ -723,80 +723,80 @@ if __name__ == "__main__":
         print(f"Optimal Action: {optimal_action}; Magnitude: {np.linalg.norm(optimal_action):.4f}")
         print(f"Optimal Objective Function Value: {optimal_fun:.4f}; (Improvement: {increment:.4f})")
 
-        ### 将动作代入EKF验证 ###
-        step_num = 10    # 分为几步完成
-        action_value = optimal_action / step_num
+        # ### 将动作代入EKF验证 ###
+        # step_num = 10    # 分为几步完成
+        # action_value = optimal_action / step_num
 
-        deform_data = simulate_deformation(
-            mesh_file=MESH_DATA,
-            contact_idx=contact_idx,
-            fix_nodes=FIXED_NODES,
-            hard_ele_list=HARD_ELE_LIST,
-            action_value=action_value,
-            action_step=step_num,
-            save_data=False
-        )
+        # deform_data = simulate_deformation(
+        #     mesh_file=MESH_DATA,
+        #     contact_idx=contact_idx,
+        #     fix_nodes=FIXED_NODES,
+        #     hard_ele_list=HARD_ELE_LIST,
+        #     action_value=action_value,
+        #     action_step=step_num,
+        #     save_data=False
+        # )
 
-        assert step_num == deform_data["post_x"].shape[0], "Simulated step number does not match expected."
+        # assert step_num == deform_data["post_x"].shape[0], "Simulated step number does not match expected."
 
-        dforce_dw_list = []
-        dforce_dq_list = []
-        internal_force_list = []
-        measured_f_ext_list = []
-        contact_idx_list = []
-        for step_i in range(step_num):
-            q_sim = deform_data["post_x"][step_i, :, :2]
-            f_sim = deform_data["internal_force"][step_i, :, :]
+        # dforce_dw_list = []
+        # dforce_dq_list = []
+        # internal_force_list = []
+        # measured_f_ext_list = []
+        # contact_idx_list = []
+        # for step_i in range(step_num):
+        #     q_sim = deform_data["post_x"][step_i, :, :2]
+        #     f_sim = deform_data["internal_force"][step_i, :, :]
 
-            measure_node_force = torch.from_numpy(f_sim[OBSERVE_NODES, :]).to("cuda").double()
-            measure_q = torch.from_numpy(q_sim).to("cuda").double()
+        #     measure_node_force = torch.from_numpy(f_sim[OBSERVE_NODES, :]).to("cuda").double()
+        #     measure_q = torch.from_numpy(q_sim).to("cuda").double()
 
-            soft_init_model.reconstruct_stretch_weight(init_k_guess)
-            soft_init_model.precomputation()
+        #     soft_init_model.reconstruct_stretch_weight(init_k_guess)
+        #     soft_init_model.precomputation()
 
-            # 运行物理步 (Forward & Backward)
-            soft_init_model.node_pos.from_torch(measure_q) # 使用观测位置
+        #     # 运行物理步 (Forward & Backward)
+        #     soft_init_model.node_pos.from_torch(measure_q) # 使用观测位置
 
-            soft_init_model.cal_deformation_gradient()
-            soft_init_model.update_internal_force()
-            soft_init_model.cal_internal_force_gradient() # 计算 dforce_dw
+        #     soft_init_model.cal_deformation_gradient()
+        #     soft_init_model.update_internal_force()
+        #     soft_init_model.cal_internal_force_gradient() # 计算 dforce_dw
 
-            soft_init_model.hessian_stretch()
-            soft_init_model.cal_internal_force_gradient_pos()    # 计算 dforce_dq
+        #     soft_init_model.hessian_stretch()
+        #     soft_init_model.cal_internal_force_gradient_pos()    # 计算 dforce_dq
 
-            dforce_dw_torch = soft_init_model.dforce_dw.to_torch(device="cuda").double()
-            dforce_dq_torch = soft_init_model.dforce_dq.to_torch(device="cuda").double()
-            internal_force_torch = soft_init_model.force.to_torch(device="cuda").double()
+        #     dforce_dw_torch = soft_init_model.dforce_dw.to_torch(device="cuda").double()
+        #     dforce_dq_torch = soft_init_model.dforce_dq.to_torch(device="cuda").double()
+        #     internal_force_torch = soft_init_model.force.to_torch(device="cuda").double()
 
-            dforce_dw_list.append(dforce_dw_torch)
-            dforce_dq_list.append(dforce_dq_torch)
-            internal_force_list.append(internal_force_torch)
-            measured_f_ext_list.append(measure_node_force.double())
-            contact_idx_list.append(contact_idx)
+        #     dforce_dw_list.append(dforce_dw_torch)
+        #     dforce_dq_list.append(dforce_dq_torch)
+        #     internal_force_list.append(internal_force_torch)
+        #     measured_f_ext_list.append(measure_node_force.double())
+        #     contact_idx_list.append(contact_idx)
 
-            # write_mshv2_triangular(OUTPUT_DIR / f"simulated_mesh_step{step_i}.msh", measure_q.cpu().numpy(), soft_init_model.ele.to_numpy())
+        #     # write_mshv2_triangular(OUTPUT_DIR / f"simulated_mesh_step{step_i}.msh", measure_q.cpu().numpy(), soft_init_model.ele.to_numpy())
 
-        ekf_candidate.batch_update(
-            dforce_dw_list,
-            dforce_dq_list,
-            internal_force_list,
-            measured_f_ext_list,
-            contact_idx_list
-        )
+        # ekf_candidate.batch_update(
+        #     dforce_dw_list,
+        #     dforce_dq_list,
+        #     internal_force_list,
+        #     measured_f_ext_list,
+        #     contact_idx_list
+        # )
 
-        entropy_now = ekf_candidate.get_entropy()
-        entropy_reduction = entropy_prior - entropy_now
-        print(f"=> Reduced Entropy: {entropy_reduction:.4f}; Posterior Entropy: {entropy_now:.4f}")
+        # entropy_now = ekf_candidate.get_entropy()
+        # entropy_reduction = entropy_prior - entropy_now
+        # print(f"=> Reduced Entropy: {entropy_reduction:.4f}; Posterior Entropy: {entropy_now:.4f}")
 
         evaluation_results[contact_idx] = {
             'optimal_action': optimal_action,
             'fun_increment': increment,
-            'entropy_reduction': entropy_reduction,
+            # 'entropy_reduction': entropy_reduction,
             'covariance': ekf_candidate.P.cpu().numpy()
         }
     print(f"\nTotal Evaluation Time for {len(candidate_contact)} contacts: {time.time() - start_time:.4f} seconds")
 
-    save_path = OUTPUT_DIR / "strain" / "evaluation_results-1.pkl"
+    save_path = OUTPUT_DIR / "strain" / "evaluation_results-2.pkl"
     with open(save_path, 'wb') as f:
         pickle.dump(evaluation_results, f)
     print(f"Results successfully saved to {save_path}")

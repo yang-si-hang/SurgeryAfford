@@ -4,6 +4,7 @@
 created at 2026-04-13
 """
 from pathlib import Path
+import meshio
 import numpy as np
 from collections import deque
 import maxflow
@@ -17,42 +18,41 @@ from utilize.mesh_io import read_mshv2_triangular
 # demo_2, 圆形状
 # hard_ele_list = [151, 174, 176, 177, 178, 179, 182, 186, 218, 219, 220, 306]
 # tissue_1, 圆形状 + 长条状
-# hard_ele_list = [48, 55, 63, 91, 94, 126, 128, 138, 174, 201, 204, 247, 250, 254, 255, 
-#                  256, 297, 327, 330, 379, 390, 391, 393, 396, 397, 401, 403, 412] + \
-#                 [238, 278, 287, 288, 359, 365, 366, 367, 370, 374, 414]
-# tissue_2， 长条状
+hard_ele_list = [48, 55, 63, 91, 94, 126, 128, 138, 174, 201, 204, 247, 250, 254, 255, 
+                 256, 297, 327, 330, 379, 390, 391, 393, 396, 397, 401, 403, 412] + \
+                [238, 278, 287, 288, 359, 365, 366, 367, 370, 374, 414]
+# tissue_2, 长条状
 # hard_ele_list = [66, 125, 138, 193, 197, 211, 219, 231, 234, 280, 284, 285, 290, 
 #                  298, 301, 344, 345, 370, 376]
 
+# real experiment, 圆形状
 # hard_ele_list = [28, 30, 32, 35, 36, 37, 61, 64, 65, 79, 84, 139, 160, 458, 459, 686, 687]  # sponge_1 
-# hard_ele_list = [44, 51, 52, 53, 55, 61, 66, 67, 68, 69, 123, 132, 139, 486, 487, 488, 489]  # sponge_2
-hard_ele_list = [51, 52, 53, 55, 61, 66, 67, 68, 123, 129, 132, 140, 143, 486, 487, 488, 489]
+# hard_ele_list = [51, 52, 53, 55, 61, 66, 67, 68, 123, 129, 132, 140, 143, 472, 473, 474, 475] # sponge_2
 
 ### 从sim的数据中读取网格信息 ###
-# mesh_path = MESH_DIR / "pd_stretch_tissue_mesh_init_2.msh"
+mesh_path = MESH_DIR / "pd_stretch_tissue_mesh_init.msh"
 # mesh_path = "data/results/sim-stiff-area-est/hard-3/pd_stretch_tissue_mesh_init.msh"
-# V, F = read_mshv2_triangular(mesh_path)
+V, F = read_mshv2_triangular(mesh_path)
 
-mesh_data_file = np.load(DATA_DIR / "demo" / "real_track" / "04170230" / "tissue_mesh.npz")
-neighbors = mesh_data_file['neighbors']
-V, F = mesh_data_file['vertices'], mesh_data_file['faces']
+# mesh_data_file = np.load(DATA_DIR / "demo" / "real_track" / "04152030" / "tissue_mesh.npz")
+# neighbors = mesh_data_file['neighbors']
+# V, F = mesh_data_file['vertices'], mesh_data_file['faces']
+
 mesh_data = {"V": V, "F": F}
 
-# cell_size = 0.5 * np.linalg.norm(np.cross(V[F[:, 1]] - V[F[:, 0]], V[F[:, 2]] - V[F[:, 0]]), axis=1)
-
-# fixed_ele_list = np.loadtxt(OUTPUT_DIR / "background_ele_list.csv", delimiter=",", dtype=int).tolist()
+fixed_ele_list = np.loadtxt(OUTPUT_DIR / "background_ele_list.csv", delimiter=",", dtype=int).tolist()
 # fixed_ele_list = np.loadtxt("data/results/sim-stiff-area-est/hard-3/background_ele_list.csv", delimiter=",", dtype=int).tolist()
-fixed_ele_list = []
+# fixed_ele_list = []
 # fixed_node_list = list(range(40, 65))
-# fixed_node_list = list(range(31, 43)) + list(range(59, 64))
-fixed_node_list = list(range(32, 44)) + list(range(59, 66))
-for i, cell in enumerate(F):
-    if any(v in fixed_node_list for v in cell):
-        fixed_ele_list.append(i)
+# # fixed_node_list = list(range(32, 44)) + list(range(59, 64))
+# for i, cell in enumerate(F):
+#     if any(v in fixed_node_list for v in cell):
+#         fixed_ele_list.append(i)
+print(f"Fixed elements: {fixed_ele_list}")
 
-# variance_path = OUTPUT_DIR / "Y_ekf.csv"
+variance_path = OUTPUT_DIR / "Y_ekf.csv"
 # variance_path = "data/results/sim-stiff-area-est/hard-3/Y_ekf.csv"
-variance_path = Path(OUTPUT_DIR) / "Y_sum_ekf.csv"
+# variance_path = Path(OUTPUT_DIR) / "Y_sum_ekf.csv"
 
 variance_mat = np.loadtxt(variance_path, delimiter=",")
 variance = np.log10(np.sqrt(np.diag(variance_mat)))
@@ -102,23 +102,6 @@ def build_face_adjacency(F):
             adj_faces[faces[1]].append(faces[0])
     return adj_faces
 
-def get_k_ring_neighbors(fi, adj_faces, k):
-    """获取拓扑距离为 k 环内的所有面片索引（不包含中心面片 fi)"""
-    visited = set([fi])
-    queue = deque([(fi, 0)])
-    neighbors = []
-    while queue:
-        curr, dist = queue.popleft()
-        if dist > 0:
-            neighbors.append(curr)
-        if dist == k:
-            continue
-        for nb in adj_faces[curr]:
-            if nb not in visited:
-                visited.add(nb)
-                queue.append((nb, dist + 1))
-    return neighbors
-
 def get_edge_length(V, F, fi, fj):
     """获取两个相邻面片共享边的长度"""
     set_fi = set(F[fi])
@@ -128,84 +111,181 @@ def get_edge_length(V, F, fi, fj):
         return np.linalg.norm(V[shared_verts[0]] - V[shared_verts[1]])
     return 0.0
 
-def extract_low_value_pure_continuous(V, F, variance, fixed_ele_list, k_ring=2, lambda_smooth=5.0):
-    """
-    :param sensitivity: 控制对低值区域的敏感程度。越大，越容易把稍低于周围的区域划入前景
-    """
+def robust_sigmoid_score(x, center=None, scale=None, gain=2.5):
+    if center is None:
+        center = np.median(x)
+    if scale is None:
+        scale = np.percentile(x, 75) - np.percentile(x, 25)
+    z = (x - center) / (scale + 1e-10)
+    z = np.clip(gain * z, -30, 30)
+    return 1.0 / (1.0 + np.exp(-z))
+
+def get_ring_neighbors_range(fi, adj_faces, k_min, k_max):
+    visited = set([fi])
+    queue = deque([(fi, 0)])
+    result = []
+    while queue:
+        curr, dist = queue.popleft()
+        if k_min <= dist <= k_max:
+            result.append(curr)
+        if dist == k_max:
+            continue
+        for nb in adj_faces[curr]:
+            if nb not in visited:
+                visited.add(nb)
+                queue.append((nb, dist + 1))
+    if fi in result:
+        result.remove(fi)
+    return result
+
+def extract_low_value_region_v2(V, F, variance, fixed_ele_list, 
+                                outer_ring=(2, 4),
+                                lambda_smooth=1.0,
+                                fg_low_q=0.2,
+                                bg_high_q=0.55):
     num_faces = len(F)
     fixed_ele_set = set(fixed_ele_list)
-    
-    print("Step 1: 计算局部对比度 S(i)...")
+
     adj_faces = build_face_adjacency(F)
-    S = np.zeros(num_faces)
+
+    # --------------------------------------------------
+    # 1) 主区域证据：单元本身低值
+    # 低值区域 => 分数越大越像前景
+    # --------------------------------------------------
+    value_score_raw = -variance
+    prob_value = robust_sigmoid_score(value_score_raw, gain=2.8)
+
+    valid_mask = np.ones(num_faces, dtype=bool)
+    valid_mask[list(fixed_ele_set)] = False
+
+    # --------------------------------------------------
+    # 2) 辅助区域证据：外环对比
+    # 外环均值 - 当前值 越大，说明当前位置处在低值盆地中
+    # --------------------------------------------------
+    local_score = np.zeros(num_faces)
+    k_min, k_max = outer_ring
+
+    global_mad = np.median(np.abs(variance[valid_mask] - np.median(variance[valid_mask])))
+    mad_floor = 0.25 * global_mad
+
     for i in range(num_faces):
-        neighbors = get_k_ring_neighbors(i, adj_faces, k_ring)
-        if len(neighbors) > 0:
-            # weights = cell_size[neighbors]
-            # weighted_mean = np.sum(variance[neighbors] * weights) / np.sum(weights)
-            neighbor_mean = np.mean(variance[neighbors])
-            S[i] = variance[i] - neighbor_mean
-            
-    print("Step 2: 使用 Sigmoid 函数将对比度转化为概率（无需阈值）...")
+        outer = get_ring_neighbors_range(i, adj_faces, k_min, k_max)
+        if len(outer) == 0:
+            local_score[i] = 0.0
+            continue
 
-    IQR_grad = np.percentile(S, 75) - np.percentile(S, 25)
-    k_grad = 5.0 / (IQR_grad + 1e-10)
+        outer_vals = variance[outer]
+        med_outer = np.median(outer_vals)
+        mad_outer = np.median(np.abs(outer_vals - med_outer))
+        denom = max(1.4826 * mad_outer, mad_floor, 1e-10)
+        local_score[i] = (med_outer - variance[i]) / denom
 
-    IQR_value = np.percentile(variance, 75) - np.percentile(variance, 25)
-    k_value = 2.0 / (IQR_value + 1e-10)
+    # 以 0 为中心更合理：0 表示与外环持平；>0 表示低于外环
+    prob_local = robust_sigmoid_score(local_score, center=0.0, scale=1.0, gain=1.4)
 
-    prob_grad = 1.0 / (1.0 + np.exp(k_grad * (S - np.median(S))))
-    prob_value = 1.0 / (1.0 + np.exp(k_value * (variance - np.median(variance))))
+    # --------------------------------------------------
+    # 3) 融合：不要乘法，用加权和
+    # prob_value 主导，prob_outer 辅助
+    # --------------------------------------------------
+    eps = 1e-6
+    def logit(p):
+        p = np.clip(p, eps, 1 - eps)
+        return np.log(p / (1 - p))
 
-    prob_fg = prob_value * prob_grad  # 直接乘法融合两种信息，得到前景概率
-    
-    print("Step 3: 构建 Maxflow...")
+    # fused_score = 1.4 * logit(prob_value) + 0.5 * logit(prob_outer)
+    # fused_score = .3 * logit(prob_value) + 1. * logit(prob_local)
+    fused_score = 0.2 * logit(prob_value) + 1 * logit(prob_local) - 1.0
+    fused_score = np.clip(fused_score, -30, 30)
+    prob_fg = 1.0 / (1.0 + np.exp(-fused_score))
+
+    # --------------------------------------------------
+    # 4) 构造前景/背景种子
+    # 前景：极低值核心
+    # 背景：高值区 + fixed background
+    # --------------------------------------------------
+    # fg_local_z = 1.0
+
+    # low_th = np.quantile(variance[valid_mask], fg_low_q)
+    # high_th = np.quantile(variance[valid_mask], bg_high_q)
+    # outer_med = np.percentile(outer_contrast[valid_mask], 50)
+
+    # fg_seed = valid_mask & (variance <= low_th) & (outer_contrast >= outer_med)
+    # fg_seed = valid_mask & (local_score >= fg_local_z) & (variance <= low_th)
+    # bg_seed = valid_mask & (variance >= high_th)
+    fg_seed = valid_mask & (prob_fg >= np.quantile(prob_fg[valid_mask], 0.90))
+    # bg_seed = valid_mask & (prob_fg <= np.quantile(prob_fg[valid_mask], 0.10))
+    bg_seed = valid_mask & \
+            (variance >= np.quantile(variance[valid_mask], 0.75)) & \
+            (local_score <= 0.0)
+    bg_seed[list(fixed_ele_set)] = True
+
+    # --------------------------------------------------
+    # 5) Graph Cut
+    # --------------------------------------------------
     g = maxflow.Graph[float]()
     node_ids = g.add_nodes(num_faces)
-    
-    # --- N-links (平滑项) ---
+
+    # N-links
     var_diff_sq = []
     for i in range(num_faces):
         for j in adj_faces[i]:
             if i < j:
-                var_diff_sq.append((variance[i] - variance[j])**2)
-    beta = 1.0 / (2.0 * np.mean(var_diff_sq) + 1e-10) if var_diff_sq else 1.0
+                var_diff_sq.append((variance[i] - variance[j]) ** 2)
+    beta = 1.0 / (2.0 * np.mean(var_diff_sq) + 1e-10) if len(var_diff_sq) > 0 else 1.0
 
-    mean_edge_len = np.mean([get_edge_length(V, F, i, j) for i in range(num_faces) for j in adj_faces[i] if i < j])
-        
+    edge_lengths = []
+    for i in range(num_faces):
+        for j in adj_faces[i]:
+            if i < j:
+                edge_lengths.append(get_edge_length(V, F, i, j))
+    mean_edge_len = np.mean(edge_lengths) if len(edge_lengths) > 0 else 1.0
+
     for i in range(num_faces):
         for j in adj_faces[i]:
             if i < j:
                 edge_len = get_edge_length(V, F, i, j)
-                # w = lambda_smooth * edge_len * np.exp(-beta * (variance[i] - variance[j])**2)
-                w = (1 * edge_len / mean_edge_len) * np.exp(-beta * (variance[i] - variance[j])**2) * lambda_smooth
-                # print(f"Adding edge between faces {i} and {j} with weight {w}")
+                w = lambda_smooth * (edge_len / (mean_edge_len + 1e-10)) * \
+                    np.exp(-beta * (variance[i] - variance[j]) ** 2)
                 g.add_edge(node_ids[i], node_ids[j], w, w)
-                
-    # --- T-links ---
-    eps = 1e-3
-    cost_fg = -np.log(prob_fg + eps)      # 分配给前景的代价
-    cost_bg = -np.log(1.0 - prob_fg + eps) # 分配给背景的代价
-    
-    K = max(cost_fg.max(), cost_bg.max()) * 100 
-    
+
+    # T-links
+    cost_fg = -np.log(np.clip(prob_fg, eps, 1.0))
+    cost_bg = -np.log(np.clip(1.0 - prob_fg, eps, 1.0))
+    K = max(cost_fg.max(), cost_bg.max()) * 100.0
+
+    # for i in range(num_faces):
+    #     if i in fixed_ele_set or bg_seed[i]:
+    #         g.add_tedge(node_ids[i], K, 0.0)   # 强背景（source, gc_labels==0）
+    #     elif fg_seed[i]:
+    #         g.add_tedge(node_ids[i], 0.0, K)   # 强前景（sink, gc_labels==1）
+    #     else:
+    #         g.add_tedge(node_ids[i], cost_fg[i], cost_bg[i])
+
     for i in range(num_faces):
         if i in fixed_ele_set:
-            # 只有固定的背景单元使用硬约束
-            g.add_tedge(node_ids[i], 0, K)
+            g.add_tedge(node_ids[i], K, 0.0)   # 强背景
         else:
             g.add_tedge(node_ids[i], cost_fg[i], cost_bg[i])
-            
-    print("Step 4: 运行最大流/最小割...")
+
     g.maxflow()
     gc_labels = g.get_grid_segments(node_ids).astype(np.int32)
+
+    # 强制 fixed 保持背景
     gc_labels[list(fixed_ele_set)] = 0
-    
-    print(f"完成！检测到低值区域单元数: {np.sum(gc_labels == 1)}")
-    return S, gc_labels, prob_fg, prob_value, prob_grad
 
+    # high_prob_bg = np.where((prob_fg >= 0.9) & (gc_labels == 0))[0]
+    # print("high prob but background:", high_prob_bg)
+    # print("prob_fg:", prob_fg[high_prob_bg])
+    # print("fg_seed:", fg_seed[high_prob_bg])
+    # print("bg_seed:", bg_seed[high_prob_bg])
+    # print("variance:", variance[high_prob_bg])
+    # print("local_score:", local_score[high_prob_bg])
 
-S, gc_labels, prob_fg, prob_value, prob_grad = extract_low_value_pure_continuous(V, F, smoothed_variance, fixed_ele_list, k_ring=2, lambda_smooth=1.)
+    return local_score, gc_labels, prob_fg, prob_value, prob_local, fg_seed, bg_seed
+
+outer_contrast, gc_labels, prob_fg, prob_value, prob_outer, fg_seed, bg_seed = extract_low_value_region_v2(V, F, smoothed_variance, fixed_ele_list, )
+
+print(f"分割的目标单元数: {np.sum(gc_labels == 1)}/{len(gc_labels)}; 实际单元数 (hard label): {len(hard_ele_list)}")
 
 np.savetxt(OUTPUT_DIR / "low_value_indices.csv", np.where(gc_labels == 1)[0], delimiter=",", fmt="%d")
 print(f"Low-value region indices saved to {OUTPUT_DIR / 'low_value_indices.csv'}")
@@ -216,11 +296,11 @@ from matplotlib.colors import ListedColormap
 plt.figure(figsize=(12,6))
 plt.subplot(121)
 plt.tripcolor(mesh_data["V"][:, 0], mesh_data["V"][:, 1], mesh_data["F"], 
-                facecolors=prob_fg, shading='flat', 
+                facecolors=smoothed_variance, shading='flat', 
                 edgecolors='k', linewidth=0.6, cmap="RdBu_r")
-plt.colorbar(label='Local Contrast S(i)')
+plt.colorbar(label='Smoothed log-std field')
+plt.title('Smoothed uncertainty field')
 plt.axis('equal')
-plt.title('Local Contrast S(i) Histogram')
 
 plt.subplot(122)
 cmap_custom = plt.get_cmap('tab10', 2)
@@ -234,6 +314,20 @@ plt.title('Variance Histogram')
 plt.show()
 plt.savefig(f"{VISUALIZATION_DIR}/low_region_prob.svg", transparent=True, format='svg', dpi=300, bbox_inches='tight')
 print(f"Low-value region visualization saved to {VISUALIZATION_DIR}/low_region_prob.svg")
+
+cells = [("triangle", F.astype(np.int32))]
+mesh = meshio.Mesh(
+V[:, :2],
+cells,
+cell_data={
+    "SmoothedVariance": [smoothed_variance],
+    "GC_Label": [gc_labels.astype(int)],
+    "Prob_FG": [prob_fg],
+    "Prob_Value": [prob_value],
+    "Prob_Local": [prob_outer],
+}
+)
+mesh.write(f"{OUTPUT_DIR}/mesh_low_value.vtu")
 
 
 # exit()
@@ -277,108 +371,191 @@ print(f"Low-value region visualization saved to {ARTICLE_VIS_DIR}/low_value_regi
 # 独立于分类算法的纯场量评估 (Field-Level Metrics)
 # ==========================================
 from sklearn.metrics import roc_auc_score, average_precision_score
-print("\nStep: Evaluating Raw Uncertainty Field vs Ground Truth...")
+print("\nStep: Evaluating Field Separability vs Ground Truth...")
 
-# 需要根据数据本身的空间调整表述，比如Log空间还是Linear空间
-value = prob_value
+def get_band_mask_from_gt(gt_mask, adj_faces, k_min=1, k_max=3):
+    gt_idx = np.where(gt_mask)[0]
+    band_mask = np.zeros(len(gt_mask), dtype=bool)
 
-# 1. 准备真实的 Ground Truth Mask (如果之前没定义的话)
+    for fi in gt_idx:
+        outer = get_ring_neighbors_range(fi, adj_faces, k_min, k_max)
+        band_mask[outer] = True
+
+    band_mask[gt_mask] = False
+    return band_mask
+
+### Local ###
+adj_faces = build_face_adjacency(F)
+
 gt_mask = np.zeros(n_cells, dtype=bool)
-# hard_ele_list 是真实目标单元的索引列表
 gt_mask[hard_ele_list] = True
 
-# bg_mask = np.ones(n_cells, dtype=bool)
-# bg_mask[hard_ele_list] = False
-# bg_mask = (~gt_mask)
+band_mask = get_band_mask_from_gt(gt_mask, adj_faces, 1, 3)
+band_mask[fixed_ele_list] = False
+print(f"GT region: {np.where(gt_mask==True)}")
+print(f"Band region: {np.where(band_mask==True)}")
 
-# 排除 fixed 节点带来的强偏置干扰（它们在物理上不参与变形评估）
+field_score = -smoothed_variance
+
+local_eval_mask = gt_mask | band_mask
+y_true_local = gt_mask[local_eval_mask]
+y_score_local = field_score[local_eval_mask]
+
+band_roc_auc = roc_auc_score(y_true_local, y_score_local)
+band_pr_auc = average_precision_score(y_true_local, y_score_local)
+
+target_vals = field_score[gt_mask]
+band_vals = field_score[band_mask]
+
+med_t = np.median(target_vals)
+med_b = np.median(band_vals)
+mad_t = np.median(np.abs(target_vals - med_t)) + 1e-10
+mad_b = np.median(np.abs(band_vals - med_b)) + 1e-10
+local_robust_cnr = np.abs(med_t - med_b) / (1.4826 * (mad_t + mad_b) + 1e-10)
+
+mean_t, mean_b = np.mean(target_vals), np.mean(band_vals)
+var_t, var_b = np.var(target_vals), np.var(band_vals)
+local_fdr = (mean_t - mean_b) ** 2 / (var_t + var_b + 1e-10)
+
+print(f"mean_t: {mean_t:.4f}, mean_b: {mean_b:.4f}, var_t: {var_t:.4f}, var_b: {var_b:.4f}")
+
+import matplotlib.pyplot as plt
+plt.figure(figsize=(6,4))
+plt.hist(target_vals, bins=50, alpha=0.5, label='GT')
+plt.hist(band_vals, bins=50, alpha=0.5, label='Band')
+plt.legend()
+plt.savefig(f"field_value_distribution-0.svg", transparent=False, format='svg', dpi=300, bbox_inches='tight')
+
+print(f"[Local Evaluation] (Using GT band as reference)")
+print(f"  Band ROC-AUC: {band_roc_auc:.4f}")
+print(f"  Band PR-AUC: {band_pr_auc:.4f}")
+print(f"  Local Robust CNR: {local_robust_cnr:.4f}")
+print(f"  Local FDR: {local_fdr:.4f}")
+
+print(f"[Global Evaluation]")
+# ---------------------------------------------------------
+# 1. Ground Truth mask
+# ---------------------------------------------------------
+gt_mask = np.zeros(n_cells, dtype=bool)
+gt_mask[hard_ele_list] = True
+
+# ---------------------------------------------------------
+# 2. Evaluation mask
+# ---------------------------------------------------------
 eval_mask = np.ones(n_cells, dtype=bool)
 eval_mask[fixed_ele_list] = False
 
-# 提取用于评估的真值和标量场
+# ---------------------------------------------------------
+# 3. Field score
+# 目标是低值区域，所以取负号后“越大越像目标”
+# ---------------------------------------------------------
+field_score = -smoothed_variance
+
 y_true = gt_mask[eval_mask]
-# 这里使用对数方差或线性方差都可以，因为 AUC 只看排序。
-# 但对于 CNR，我们使用之前确定的具备尺度不变性的对数方差 (variance)
-y_score = value[eval_mask] 
+y_score = field_score[eval_mask]
 
 # ---------------------------------------------------------
-# 指标 1: ROC-AUC (无需阈值的排序绝对准度)
+# 4. ROC-AUC / PR-AUC
 # ---------------------------------------------------------
 try:
-    auc_score = roc_auc_score(y_true, y_score)
-    print(f"  [Field Metric 1] ROC-AUC: {auc_score:.4f} (Closer to 1.0 is better)")
+    roc_auc = roc_auc_score(y_true, y_score)
+    print(f"  [Field Metric 1] ROC-AUC: {roc_auc:.4f} (Closer to 1.0 is better)")
 except ValueError:
-    print("  [Field Metric 1] ROC-AUC: N/A (Only one class present in y_true)")
+    print("  [Field Metric 1] ROC-AUC: N/A")
 
-# ---------------------------------------------------------
-# 指标 2: Average Precision (应对小目标的极度严苛指标)
-# ---------------------------------------------------------
 try:
-    ap_score = average_precision_score(y_true, y_score)
-    print(f"  [Field Metric 2] Average Precision (PR-AUC): {ap_score:.4f} (Higher is better)")
+    pr_auc = average_precision_score(y_true, y_score)
+    print(f"  [Field Metric 2] PR-AUC: {pr_auc:.4f} (Higher is better)")
 except ValueError:
-    print("  [Field Metric 2] Average Precision: N/A")
+    print("  [Field Metric 2] PR-AUC: N/A")
 
 # ---------------------------------------------------------
-# 指标 3: GT-based CNR (物理场信噪比)
+# 5. Robust CNR / FDR
 # ---------------------------------------------------------
-gt_target_values = value[gt_mask & eval_mask]
-gt_bg_values = value[(~gt_mask) & eval_mask]
+target_vals = field_score[gt_mask & eval_mask]
+bg_vals = field_score[(~gt_mask) & eval_mask]
 
-if len(gt_target_values) > 0 and len(gt_bg_values) > 0:
-    mean_gt_target = np.mean(gt_target_values)
-    mean_gt_bg = np.mean(gt_bg_values)
-    std_gt_bg = np.std(gt_bg_values)
-    std_gt_target = np.std(gt_target_values)
-    
-    gt_cnr = np.abs(mean_gt_target - mean_gt_bg) / (std_gt_bg + std_gt_target + 1e-10)
-    print(f"  [Field Metric 3] GT-based CNR: {gt_cnr:.4f} (Higher means better signal contrast)")
+if len(target_vals) > 0 and len(bg_vals) > 0:
+    # Robust CNR
+    med_t = np.median(target_vals)
+    med_b = np.median(bg_vals)
+
+    mad_t = np.median(np.abs(target_vals - med_t)) + 1e-10
+    mad_b = np.median(np.abs(bg_vals - med_b)) + 1e-10
+
+    robust_cnr = np.abs(med_t - med_b) / (1.4826 * (mad_t + mad_b) + 1e-10)
+    print(f"  [Field Metric 3] Robust CNR: {robust_cnr:.4f} (Higher is better)")
+
+    # FDR
+    mean_t = np.mean(target_vals)
+    mean_b = np.mean(bg_vals)
+    var_t = np.var(target_vals)
+    var_b = np.var(bg_vals)
+
+    fdr = (mean_t - mean_b) ** 2 / (var_t + var_b + 1e-10)
+    print(f"  [Field Metric 4] FDR: {fdr:.4f} (Higher is better)")
 else:
-    print("  [Field Metric 3] GT-based CNR: N/A (Missing target or background regions)")
+    print("  [Field Metric 3] Robust CNR: N/A")
+    print("  [Field Metric 4] FDR: N/A")
 
-# 提取线性尺度（物理标准差）和对数尺度的数据
-# 记得 eval_mask 已经排除了 fixed_ele_list 的干扰
-linear_std = value
+# print("\nStep: Evaluating Segmentation Quality vs Ground Truth...")
 
-gt_linear_target = linear_std[gt_mask & eval_mask]
-gt_linear_bg = linear_std[(~gt_mask) & eval_mask]
+# ---------------------------------------------------------
+# 1. Ground Truth mask
+# ---------------------------------------------------------
+gt_mask = np.zeros(n_cells, dtype=bool)
+gt_mask[hard_ele_list] = True
 
-gt_log_target = value[gt_mask & eval_mask]
-gt_log_bg = value[(~gt_mask) & eval_mask]
+# ---------------------------------------------------------
+# 2. Evaluation mask
+# 排除 fixed 区域，避免人为硬约束影响评估
+# ---------------------------------------------------------
+eval_mask = np.ones(n_cells, dtype=bool)
+eval_mask[fixed_ele_list] = False
 
-if len(gt_log_target) > 0 and len(gt_log_bg) > 0:
-    # ---------------------------------------------------------
-    # 指标 4: GT-based FDR (费舍尔判别比)
-    # 使用对数空间计算，保证尺度不变性
-    # ---------------------------------------------------------
-    # mean_gt_log_target = np.mean(gt_log_target)
-    # mean_gt_log_bg = np.mean(gt_log_bg)
-    # var_gt_log_target = np.var(gt_log_target)
-    # var_gt_log_bg = np.var(gt_log_bg)
-    
-    # fdr_gt = ((mean_gt_log_target - mean_gt_log_bg)**2) / (var_gt_log_target + var_gt_log_bg + 1e-10)
-    # print(f"  [Field Metric 4] (Log) GT-based FDR: {fdr_gt:.4f} (Higher means better statistical separability)")
+# ---------------------------------------------------------
+# 3. Prediction mask
+# 这里沿用你当前代码的约定：gc_labels == 1 表示 low-value region
+# ---------------------------------------------------------
+pred_mask = (gc_labels == 1)
 
-    mean_t = np.mean(gt_linear_target)
-    mean_b = np.mean(gt_linear_bg)
-    var_t = np.var(gt_linear_target)
-    var_b = np.var(gt_linear_bg)
+# 只在有效区域内评估
+gt_eval = gt_mask[eval_mask]
+pred_eval = pred_mask[eval_mask]
 
-    fdr_gt = ((mean_t - mean_b) ** 2) / (var_t + var_b + 1e-10)
-    print(f"  [Field Metric 4] (Linear) GT-based FDR: {fdr_gt:.4f} (Higher means better statistical separability)")
+# ---------------------------------------------------------
+# 4. Confusion terms
+# ---------------------------------------------------------
+tp = np.sum(pred_eval & gt_eval)
+fp = np.sum(pred_eval & (~gt_eval))
+fn = np.sum((~pred_eval) & gt_eval)
+tn = np.sum((~pred_eval) & (~gt_eval))
 
-    # ---------------------------------------------------------
-    # 指标 5: GT-based Background Suppression Ratio (背景抑制比)
-    # 使用线性空间计算，反映真实的物理数值比例变化
-    # ---------------------------------------------------------
-    mean_gt_linear_target = np.mean(gt_linear_target)
-    mean_gt_linear_bg = np.mean(gt_linear_bg)
-    
-    linear_ratio = mean_gt_linear_target / (mean_gt_linear_bg + 1e-10)
-    linear_distance = np.mean(gt_linear_target) - np.mean(gt_linear_bg)
-    # geometric_ratio = np.exp(np.mean(gt_log_target) - np.mean(gt_log_bg))
-    print(f"  [Field Metric 5] GT-based Background Suppression Distance: {linear_distance:.4f} (Higher means target is relatively enhanced)")
-    print(f"  [Field Metric 6] GT-based Background Suppression Ratio: {linear_ratio:.4f} (Higher means target is relatively enhanced)")
+eps = 1e-10
 
-else:
-    print("  [Field Metrics] N/A (Missing target or background regions in GT)")
+# ---------------------------------------------------------
+# 5. Metrics
+# ---------------------------------------------------------
+dice = 2.0 * tp / (2.0 * tp + fp + fn + eps)
+iou = tp / (tp + fp + fn + eps)
+precision = tp / (tp + fp + eps)
+recall = tp / (tp + fn + eps)
+specificity = tn / (tn + fp + eps)
+f1 = 2.0 * precision * recall / (precision + recall + eps)
+
+# ---------------------------------------------------------
+# 6. Print
+# ---------------------------------------------------------
+print(f"[Global Segmentation Evaluation]")
+print(f"  [Seg Metric 1] Dice:       {dice:.4f}")
+print(f"  [Seg Metric 2] IoU:        {iou:.4f}")
+print(f"  [Seg Metric 3] Precision:  {precision:.4f}")
+print(f"  [Seg Metric 4] Recall:     {recall:.4f}")
+print(f"  [Seg Metric 5] Specificity:{specificity:.4f}")
+print(f"  [Seg Metric 6] F1-score:   {f1:.4f}")
+
+# print("\n  Confusion counts:")
+# print(f"    TP = {tp}")
+# print(f"    FP = {fp}")
+# print(f"    FN = {fn}")
+# print(f"    TN = {tn}")
