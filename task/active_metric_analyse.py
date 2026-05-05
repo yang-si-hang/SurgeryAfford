@@ -5,8 +5,8 @@ import matplotlib.pyplot as plt
 from utilize.mesh_io import read_mshv2_triangular
 from const import *
 
-# with open(OUTPUT_DIR / "strain" / "results-real-1.pkl", 'rb') as f:
-with open(OUTPUT_DIR / "entropy" / "evaluation_results_1.pkl", 'rb') as f:
+with open(OUTPUT_DIR / "strain-weighted" / "sws-1.pkl", 'rb') as f:
+# with open(OUTPUT_DIR / "entropy" / "evaluation_results_1.pkl", 'rb') as f:
     loaded_results = pickle.load(f)
 
 # max_entropy_reduction = max(loaded_results.items(), key=lambda x: x[1]['entropy_reduction'])

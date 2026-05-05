@@ -272,6 +272,7 @@ class StiffnessEKF:
         P_inv_pre = torch.inverse(self.P)
         # sign, logdet = torch.linalg.slogdet(P_inv_pre)
         # print(f"Prior Info Matrix logdet: {-logdet.cpu().item():.6e}, sign: {sign}")
+        delta_Y_dict = {}
 
         # 2. 遍历 Batch，累加每个观测点的贡献
         for i in range(len(dforce_dw_list)):
@@ -303,6 +304,7 @@ class StiffnessEKF:
             
             # 更新 Hessian 贡献: A^T * R^-1 * A
             delta_Y += A_i.T @ R_inv_Ai
+            delta_Y_dict[f"delta_Y_{i}"] = delta_Y.cpu().numpy()
             # np.savetxt(OUTPUT_DIR / f"A_{i}.csv", A_i.cpu().numpy(), delimiter=",")
             # np.savetxt(OUTPUT_DIR / f"delta_Y_contrib_{i}.csv", (A_i.T @ R_inv_Ai).cpu().numpy(), delimiter=",")
             
@@ -318,6 +320,7 @@ class StiffnessEKF:
         # print(f"Post Info Matrix logdet: {-logdet.cpu().item():.6e}, sign: {sign}")
 
         self.delta_Y = delta_Y
+        np.savez(demo_dir / "delta_Y.npz", **delta_Y_dict)
         
         # 更新协方差
         self.P = torch.inverse(P_inv_post)
@@ -397,9 +400,9 @@ if __name__ == "__main__":
     SCALE = 6.e-4
     
     # load dataset #
-    demo_dir = DATA_DIR / "demo" / "real_track" / "04170230"
+    demo_dir = DATA_DIR / "demo" / "real_track" / "05030806"
 
-    with h5py.File(demo_dir / "test-5-cut_data.hdf5", 'r') as f:
+    with h5py.File(demo_dir / "test-4-cut_data.hdf5", 'r') as f:
         # 读取轨迹
         positions = f['trajectory_data/positions'][:] * SCALE  # (T, N, 2)
         frames = f['trajectory_data/frame_indices'][:] # (T,)

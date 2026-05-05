@@ -1,5 +1,6 @@
 """
-将实验中每次拉伸的EKF结果中的 Y 矩阵（即 stiffness estimate 的协方差矩阵）相加，得到一个总的 Y 矩阵。然后可视化这个总的 Y 矩阵的对角线元素（即每个单元 stiffness estimate 的方差），以展示哪些区域的 stiffness estimate 更不确定。
+将实验中每次拉伸的EKF结果中的 Y 矩阵（即 stiffness estimate 的协方差矩阵）相加，得到一个总的 Y 矩阵。
+然后可视化这个总的 Y 矩阵的对角线元素（即每个单元 stiffness estimate 的方差），以展示哪些区域的 stiffness estimate 更不确定。
 Date: 2026-04-04
 """
 from pathlib import Path
@@ -16,7 +17,7 @@ from const import *
 from utilize.mesh_io import read_mshv2_triangular, write_mshv2_triangular
 
 
-FILE_DIR = DATA_DIR / "demo" / "real_track" / "04152030"
+FILE_DIR = DATA_DIR / "demo" / "real_track" / "05030806"
 mesh_data_file = np.load(FILE_DIR / "tissue_mesh.npz")
 neighbors = mesh_data_file['neighbors']
 V, F = mesh_data_file['vertices'], mesh_data_file['faces']
@@ -48,6 +49,7 @@ else:
 
 c, lower = cho_factor(total_matrix)
 P_mat = cho_solve((c, lower), np.eye(total_matrix.shape[0]))
+np.savetxt(Path(FILE_DIR) / "Y_sum_ekf.csv", total_matrix, delimiter=",")
 np.savetxt(Path(OUTPUT_DIR) / "Y_sum_ekf.csv", total_matrix, delimiter=",")
 np.savetxt(Path(OUTPUT_DIR) / "P_sum_ekf.csv", P_mat, delimiter=",")
 

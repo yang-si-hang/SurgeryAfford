@@ -1,6 +1,5 @@
 """
-在信息空间取对数和面积归一化后
-使用梯度和最低值的概率乘法作为前景概率, 进行graph cut切割
+使用 z-score 场和局部外环对比作为前景概率, 进行 graph cut 切割高 z-score 区域
 created at 2026-04-13
 """
 from pathlib import Path
@@ -54,16 +53,9 @@ for i, cell in enumerate(F):
         fixed_ele_list.append(i)
 print(f"Fixed elements: {fixed_ele_list}")
 
-# variance_path = OUTPUT_DIR / "Y_ekf.csv"
-# variance_path = "data/results/sim-stiff-area-est/hard-3/Y_ekf.csv"
-variance_path = Path(OUTPUT_DIR) / "Y_sum_ekf.csv"
+zscore = np.loadtxt(OUTPUT_DIR / "zscore_mean.csv", delimiter=",")
 
-variance_mat = np.loadtxt(variance_path, delimiter=",")
-variance = np.log10(np.sqrt(np.diag(variance_mat)))
-# variance_normalized = variance / cell_size * 1.e-4 # 归一化方差，考虑单元大小对不确定性的影响
-# np.savetxt(OUTPUT_DIR / "variance_log.csv", variance, delimiter=",")
-
-assert variance.shape[0] == F.shape[0], "Variance vector length must match number of cells (triangles)."
+assert zscore.shape[0] == F.shape[0], "Z-score vector length must match number of cells (triangles)."
 n_cells = len(F)
 
 edge_to_cells = {}
@@ -80,14 +72,14 @@ for edge, cells in edge_to_cells.items():
 
 SMOOTH_ITERATIONS = 1
 ALPHA = 0.3
-smoothed_variance = variance.copy()
+smoothed_zscore = zscore.copy()
 for iteration in range(SMOOTH_ITERATIONS):
-    temp_variance = smoothed_variance.copy()
+    temp_zscore = smoothed_zscore.copy()
     for i in range(n_cells):
         neighbors_idx = cell_neighbors[i]
         if len(neighbors_idx) > 0:
-            neighbor_avg = np.mean(temp_variance[neighbors_idx])
-            smoothed_variance[i] = (1.0 - ALPHA) * temp_variance[i] + ALPHA * neighbor_avg
+            neighbor_avg = np.mean(temp_zscore[neighbors_idx])
+            smoothed_zscore[i] = (1.0 - ALPHA) * temp_zscore[i] + ALPHA * neighbor_avg
 
 
 def build_face_adjacency(F):
@@ -142,21 +134,19 @@ def get_ring_neighbors_range(fi, adj_faces, k_min, k_max):
         result.remove(fi)
     return result
 
-def extract_low_value_region_v2(V, F, variance, fixed_ele_list, 
-                                outer_ring=(2, 4),
-                                lambda_smooth=1.0,
-                                fg_low_q=0.2,
-                                bg_high_q=0.55):
+def extract_high_value_region_v2(V, F, zscore, fixed_ele_list,
+                                 outer_ring=(2, 4),
+                                 lambda_smooth=1.0):
     num_faces = len(F)
     fixed_ele_set = set(fixed_ele_list)
 
     adj_faces = build_face_adjacency(F)
 
     # --------------------------------------------------
-    # 1) 主区域证据：单元本身低值
-    # 低值区域 => 分数越大越像前景
+    # 1) 主区域证据：单元本身高 z-score
+    # 高 z-score 区域 => 分数越大越像前景
     # --------------------------------------------------
-    value_score_raw = -variance
+    value_score_raw = zscore
     prob_value = robust_sigmoid_score(value_score_raw, gain=2.8)
 
     valid_mask = np.ones(num_faces, dtype=bool)
@@ -164,12 +154,12 @@ def extract_low_value_region_v2(V, F, variance, fixed_ele_list,
 
     # --------------------------------------------------
     # 2) 辅助区域证据：外环对比
-    # 外环均值 - 当前值 越大，说明当前位置处在低值盆地中
+    # 当前值 - 外环均值 越大，说明当前位置处在局部高值峰中
     # --------------------------------------------------
     local_score = np.zeros(num_faces)
     k_min, k_max = outer_ring
 
-    global_mad = np.median(np.abs(variance[valid_mask] - np.median(variance[valid_mask])))
+    global_mad = np.median(np.abs(zscore[valid_mask] - np.median(zscore[valid_mask])))
     mad_floor = 0.25 * global_mad
 
     for i in range(num_faces):
@@ -178,25 +168,25 @@ def extract_low_value_region_v2(V, F, variance, fixed_ele_list,
             local_score[i] = 0.0
             continue
 
-        outer_vals = variance[outer]
+        outer_vals = zscore[outer]
         med_outer = np.median(outer_vals)
         mad_outer = np.median(np.abs(outer_vals - med_outer))
         denom = max(1.4826 * mad_outer, mad_floor, 1e-10)
-        local_score[i] = (med_outer - variance[i]) / denom
+        local_score[i] = (zscore[i] - med_outer) / denom
 
-    # 以 0 为中心更合理：0 表示与外环持平；>0 表示低于外环
+    # 以 0 为中心更合理：0 表示与外环持平；>0 表示高于外环
     prob_local = robust_sigmoid_score(local_score, center=0.0, scale=1.0, gain=1.4)
 
     # --------------------------------------------------
     # 3) 融合：不要乘法，用加权和
-    # prob_value 主导，prob_outer 辅助
+    # prob_value 主导，prob_local 辅助
     # --------------------------------------------------
     eps = 1e-6
     def logit(p):
         p = np.clip(p, eps, 1 - eps)
         return np.log(p / (1 - p))
 
-    # fused_score = 1.4 * logit(prob_value) + 0.5 * logit(prob_outer)
+    # fused_score = 1.4 * logit(prob_value) + 0.5 * logit(prob_local)
     # fused_score = .3 * logit(prob_value) + 1. * logit(prob_local)
     fused_score = 0.2 * logit(prob_value) + 1 * logit(prob_local) - 1.0
     fused_score = np.clip(fused_score, -30, 30)
@@ -204,22 +194,15 @@ def extract_low_value_region_v2(V, F, variance, fixed_ele_list,
 
     # --------------------------------------------------
     # 4) 构造前景/背景种子
-    # 前景：极低值核心
-    # 背景：高值区 + fixed background
+    # 前景：高 z-score 核心
+    # 背景：低 z-score 区 + fixed background
     # --------------------------------------------------
     # fg_local_z = 1.0
 
-    # low_th = np.quantile(variance[valid_mask], fg_low_q)
-    # high_th = np.quantile(variance[valid_mask], bg_high_q)
-    # outer_med = np.percentile(outer_contrast[valid_mask], 50)
-
-    # fg_seed = valid_mask & (variance <= low_th) & (outer_contrast >= outer_med)
-    # fg_seed = valid_mask & (local_score >= fg_local_z) & (variance <= low_th)
-    # bg_seed = valid_mask & (variance >= high_th)
     fg_seed = valid_mask & (prob_fg >= np.quantile(prob_fg[valid_mask], 0.90))
     # bg_seed = valid_mask & (prob_fg <= np.quantile(prob_fg[valid_mask], 0.10))
     bg_seed = valid_mask & \
-            (variance >= np.quantile(variance[valid_mask], 0.75)) & \
+            (zscore <= np.quantile(zscore[valid_mask], 0.25)) & \
             (local_score <= 0.0)
     bg_seed[list(fixed_ele_set)] = True
 
@@ -230,12 +213,12 @@ def extract_low_value_region_v2(V, F, variance, fixed_ele_list,
     node_ids = g.add_nodes(num_faces)
 
     # N-links
-    var_diff_sq = []
+    zscore_diff_sq = []
     for i in range(num_faces):
         for j in adj_faces[i]:
             if i < j:
-                var_diff_sq.append((variance[i] - variance[j]) ** 2)
-    beta = 1.0 / (2.0 * np.mean(var_diff_sq) + 1e-10) if len(var_diff_sq) > 0 else 1.0
+                zscore_diff_sq.append((zscore[i] - zscore[j]) ** 2)
+    beta = 1.0 / (2.0 * np.mean(zscore_diff_sq) + 1e-10) if len(zscore_diff_sq) > 0 else 1.0
 
     edge_lengths = []
     for i in range(num_faces):
@@ -249,7 +232,7 @@ def extract_low_value_region_v2(V, F, variance, fixed_ele_list,
             if i < j:
                 edge_len = get_edge_length(V, F, i, j)
                 w = lambda_smooth * (edge_len / (mean_edge_len + 1e-10)) * \
-                    np.exp(-beta * (variance[i] - variance[j]) ** 2)
+                    np.exp(-beta * (zscore[i] - zscore[j]) ** 2)
                 g.add_edge(node_ids[i], node_ids[j], w, w)
 
     # T-links
@@ -282,17 +265,19 @@ def extract_low_value_region_v2(V, F, variance, fixed_ele_list,
     # print("prob_fg:", prob_fg[high_prob_bg])
     # print("fg_seed:", fg_seed[high_prob_bg])
     # print("bg_seed:", bg_seed[high_prob_bg])
-    # print("variance:", variance[high_prob_bg])
+    # print("zscore:", zscore[high_prob_bg])
     # print("local_score:", local_score[high_prob_bg])
 
     return local_score, gc_labels, prob_fg, prob_value, prob_local, fg_seed, bg_seed
 
-outer_contrast, gc_labels, prob_fg, prob_value, prob_outer, fg_seed, bg_seed = extract_low_value_region_v2(V, F, smoothed_variance, fixed_ele_list, )
+local_score, gc_labels, prob_fg, prob_value, prob_local, fg_seed, bg_seed = extract_high_value_region_v2(
+    V, F, smoothed_zscore, fixed_ele_list,
+)
 
 print(f"分割的目标单元数: {np.sum(gc_labels == 1)}/{len(gc_labels)}; 实际单元数 (hard label): {len(hard_ele_list)}")
 
 np.savetxt(OUTPUT_DIR / "low_value_indices.csv", np.where(gc_labels == 1)[0], delimiter=",", fmt="%d")
-print(f"Low-value region indices saved to {OUTPUT_DIR / 'low_value_indices.csv'}")
+print(f"High z-score region indices saved to compatibility path {OUTPUT_DIR / 'low_value_indices.csv'}")
 
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
@@ -300,10 +285,10 @@ from matplotlib.colors import ListedColormap
 plt.figure(figsize=(12,6))
 plt.subplot(121)
 plt.tripcolor(mesh_data["V"][:, 0], mesh_data["V"][:, 1], mesh_data["F"], 
-                facecolors=smoothed_variance, shading='flat', 
+                facecolors=smoothed_zscore, shading='flat',
                 edgecolors='k', linewidth=0.6, cmap="RdBu_r")
-plt.colorbar(label='Smoothed log-std field')
-plt.title('Smoothed uncertainty field')
+plt.colorbar(label='Smoothed z-score field')
+plt.title('Smoothed z-score field')
 plt.axis('equal')
 
 plt.subplot(122)
@@ -311,24 +296,24 @@ cmap_custom = plt.get_cmap('tab10', 2)
 plt.tripcolor(mesh_data["V"][:, 0], mesh_data["V"][:, 1], mesh_data["F"], 
                 facecolors=gc_labels.astype(int), shading='flat', 
                 edgecolors='k', linewidth=0.6, cmap=cmap_custom, vmin=0, vmax=1)
-plt.colorbar(ticks=[0, 1], label='Segment (0=Background, 1=Low Value)')
-# plt.gca().set_yticklabels(['Background', 'Low Value'])
+plt.colorbar(ticks=[0, 1], label='Segment (0=Background, 1=High Z-score)')
+# plt.gca().set_yticklabels(['Background', 'High Z-score'])
 plt.axis('equal')
-plt.title('Variance Histogram')
+plt.title('High Z-score Region')
 plt.show()
 plt.savefig(f"{VISUALIZATION_DIR}/low_region_prob.svg", transparent=True, format='svg', dpi=300, bbox_inches='tight')
-print(f"Low-value region visualization saved to {VISUALIZATION_DIR}/low_region_prob.svg")
+print(f"High z-score region visualization saved to compatibility path {VISUALIZATION_DIR}/low_region_prob.svg")
 
 cells = [("triangle", F.astype(np.int32))]
 mesh = meshio.Mesh(
 V[:, :2],
 cells,
 cell_data={
-    "SmoothedVariance": [smoothed_variance],
+    "SmoothedZScore": [smoothed_zscore],
     "GC_Label": [gc_labels.astype(int)],
     "Prob_FG": [prob_fg],
     "Prob_Value": [prob_value],
-    "Prob_Local": [prob_outer],
+    "Prob_Local": [prob_local],
 }
 )
 mesh.write(f"{OUTPUT_DIR}/mesh_low_value.vtu")
@@ -354,7 +339,7 @@ params = {
 }
 plt.rcParams.update(params)
 
-colors = ['#F0F0F2', '#1F77B4'] # 蓝色表示低值区域
+colors = ['#F0F0F2', '#1F77B4'] # 蓝色表示高 z-score 区域
 cmap_custom = ListedColormap(colors)
 
 fig, ax1 = plt.subplots(1, 1, figsize=(6, 5), constrained_layout=True)
@@ -368,7 +353,7 @@ cbar1.ax.tick_params(length=0)
 cbar1.ax.set_yticklabels([])
 
 plt.savefig(f"{ARTICLE_VIS_DIR}/low_value_region.svg", transparent=True, format='svg', dpi=300, bbox_inches='tight')
-print(f"Low-value region visualization saved to {ARTICLE_VIS_DIR}/low_value_region.svg")
+print(f"High z-score region visualization saved to compatibility path {ARTICLE_VIS_DIR}/low_value_region.svg")
 
 
 # ==========================================
@@ -399,7 +384,7 @@ band_mask[fixed_ele_list] = False
 print(f"GT region: {np.where(gt_mask==True)}")
 print(f"Band region: {np.where(band_mask==True)}")
 
-field_score = -smoothed_variance
+field_score = smoothed_zscore
 
 local_eval_mask = gt_mask | band_mask
 y_true_local = gt_mask[local_eval_mask]
@@ -451,9 +436,9 @@ eval_mask[fixed_ele_list] = False
 
 # ---------------------------------------------------------
 # 3. Field score
-# 目标是低值区域，所以取负号后“越大越像目标”
+# 目标是高 z-score 区域，所以 z-score 越大越像目标
 # ---------------------------------------------------------
-field_score = -smoothed_variance
+field_score = smoothed_zscore
 
 y_true = gt_mask[eval_mask]
 y_score = field_score[eval_mask]
@@ -519,7 +504,7 @@ eval_mask[fixed_ele_list] = False
 
 # ---------------------------------------------------------
 # 3. Prediction mask
-# 这里沿用你当前代码的约定：gc_labels == 1 表示 low-value region
+# 这里沿用当前代码的约定：gc_labels == 1 表示 high z-score region
 # ---------------------------------------------------------
 pred_mask = (gc_labels == 1)
 

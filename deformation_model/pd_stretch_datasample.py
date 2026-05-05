@@ -222,9 +222,9 @@ if __name__ == "__main__":
     # fix_nodes = list(range(8, 17)) + list(range(28, 35))
     fix_nodes = list(range(13, 20)) + list(range(27, 34))
     # contact_node = [23, 115]   # [46, 67], [23, 115]
-    contact_node = [40, 76] # [3, 61], [4, 96]
+    contact_node = [5, 96] # [3, 61], [38, 77], [37, 95]
     # action_value = np.array([-0.05, 0.05]) / 10
-    action_value = np.array([[0.05954685, -0.00736087]]) / 10 # [-0.01959656, -0.05670971]
+    action_value = np.array([[ 0.05284968, -0.03104771]]) / 10 # [-0.01959656, -0.05670971]
     action_value = np.tile(action_value, (len(contact_node), 1))
     # hard_ele_list = [48, 55, 63, 91, 94, 126, 128, 138, 174, 201, 204, 247, 250, 254, 255, 
     #                  256, 297, 327, 330, 379, 390, 391, 393, 396, 397, 401, 403, 412] + \

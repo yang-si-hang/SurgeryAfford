@@ -593,7 +593,7 @@ if __name__ == "__main__":
     ti.init(arch=ti.cuda, debug=True, device_memory_GB=10)
 
     SCALE = 5.e-4
-    demo_dir = DATA_DIR / "demo" / "real_track" / "04162140"
+    demo_dir = DATA_DIR / "demo" / "real_track" / "05030806"
 
     mesh_data_file = np.load(demo_dir / "tissue_mesh.npz")
     neighbors = mesh_data_file['neighbors']
@@ -604,9 +604,13 @@ if __name__ == "__main__":
     Y_sum = np.loadtxt(demo_dir / "Y_sum_ekf.csv", delimiter=",")
 
     # FIXED_NODES = list(range(40, 65))
-    FIXED_NODES = list(range(31, 43)) + list(range(59, 64))
+    # FIXED_NODES = list(range(31, 43)) + list(range(59, 64))
+    FIXED_NODES = list(range(30, 43)) + list(range(58, 63)) 
+    # FIXED_NODES = list(range(8, 11)) + list(range(30, 35))
     # candidate_contact = list(set(range(0, 78)) - set(FIXED_NODES))
-    candidate_contact = list(set(range(0, 64)) - set(FIXED_NODES))
+    # candidate_contact = list(set(range(0, 64)) - set(FIXED_NODES))
+    candidate_contact = list(set(range(0, 63)) - set(FIXED_NODES))
+    # candidate_contact = list(set(range(0, 40)) - set(FIXED_NODES))
     # CON_NODES = [22, 23, 4, 5]
     contact_cells = []
     for i, face in enumerate(F):
@@ -674,7 +678,7 @@ if __name__ == "__main__":
         }
     print(f"\nTotal Evaluation Time for {len(candidate_contact)} contacts: {time.time() - start_time:.4f} seconds")
 
-    save_path = OUTPUT_DIR / "strain" / "results-real-1.pkl"
+    save_path = OUTPUT_DIR / "strain" / "uws-2.pkl"
     with open(save_path, 'wb') as f:
         pickle.dump(evaluation_results, f)
     print(f"Results successfully saved to {save_path}")
